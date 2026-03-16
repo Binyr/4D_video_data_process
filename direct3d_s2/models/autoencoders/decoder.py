@@ -348,6 +348,6 @@ class SparseSDFDecoder(SparseTransformerBase):
 
                 final_coords = torch.cat(all_coords)
                 final_feats = torch.cat(all_feats)
-                
+                # import pdb;pdb.set_trace()
                 return sp.SparseTensor(final_feats, final_coords)
             

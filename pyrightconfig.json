@@ -1,0 +1,13 @@
+{
+  "exclude": [
+    "**/build",
+    "**/dist",
+    "**/.venv",
+    "**/__pycache__",
+    "**/third_party",
+    "**/submodules",
+    "data",
+    "vis",
+    "tmp",
+  ]
+}

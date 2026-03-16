@@ -339,7 +339,7 @@ class Direct3DS2Pipeline(object):
                                 generator=generator, mode='sparse512', 
                                 mc_threshold=mc_threshold, latent_index=latent_index, 
                                 remove_interior=True, **sparse_512_sampler_params)[0]
-
+        
         if sdf_resolution == 1024:
             del latent_index
             torch.cuda.empty_cache()
