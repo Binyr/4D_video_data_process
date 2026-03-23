@@ -4,15 +4,10 @@
 """
 Launch multi-process Blender jobs on a selected chunk of GLB files.
 
-Features:
-1) Recursively scan all .glb files under root_glb_dir
-2) Split GLBs into num_chunks contiguous chunks after sorting
-3) Select one chunk by chunk_id
-4) One GLB = one task
-5) Run tasks with multiple worker processes
-6) Each worker shows its own tqdm progress bar
-7) Skip existing outputs by default
-8) Save per-task Blender logs to files so progress bars stay clean
+新增功能:
+- --cuda_devices 0 1 2 3
+- 每个 worker / process 自动绑定一个 CUDA_VISIBLE_DEVICES
+- 绑定策略: cuda_devices[worker_rank % len(cuda_devices)]
 
 Example:
 python tools/submit_extract_mesh_camera_sparse_voxel.py \
@@ -20,10 +15,11 @@ python tools/submit_extract_mesh_camera_sparse_voxel.py \
     --output_root vis/rendering_v5 \
     --output_parent_suffix _static_camera_distance_v3 \
     --worker_script tools/extract_mesh_camera_sparse_voxel_v4_interleave_light.py \
-    --blender_path /efs/yanruibin/projects/blender-4.2.1-linux-x64/blender \
+    --blender_path /group/40034/yanruibin/projects/blender-4.2.18-linux-x64/blender \
     --num_chunks 4 \
     --chunk_id 1 \
-    --num_workers 32 \
+    --num_workers 8 \
+    --cuda_devices 0 1 2 3 \
     --resolution 1024 \
     --render_engine CYCLES \
     --transparent_bg \
@@ -47,7 +43,7 @@ import glob
 import subprocess
 import multiprocessing as mp
 from dataclasses import dataclass, asdict
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 from tqdm import tqdm
 
@@ -74,6 +70,18 @@ def parse_args():
     parser.add_argument("--chunk_id", type=int, required=True)
     parser.add_argument("--num_workers", type=int, default=1)
 
+    # 新增：给 worker 分配 GPU
+    parser.add_argument(
+        "--cuda_devices",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "CUDA device ids used by launcher workers, e.g. --cuda_devices 0 1 2 3. "
+            "If omitted, inherit current environment and do not overwrite CUDA_VISIBLE_DEVICES."
+        ),
+    )
+
     parser.add_argument("--skip_existing", action="store_true", default=True)
     parser.add_argument("--no_skip_existing", dest="skip_existing", action="store_false")
     parser.add_argument("--dry_run", action="store_true")
@@ -92,6 +100,7 @@ def parse_args():
     parser.add_argument("--camera_fov_max_deg", type=float, default=70.0)
     parser.add_argument("--camera_sensor_size", type=float, default=36.0)
     parser.add_argument("--sunlight_prob", type=float, default=0.5)
+    parser.add_argument("--cycles_device", type=str, default="GPU")
 
     # optional passthrough after --extra_worker_args
     parser.add_argument("--extra_worker_args", nargs=argparse.REMAINDER, default=[])
@@ -106,6 +115,20 @@ def parse_args():
         raise ValueError("--num_workers must be > 0")
     if not (0.0 <= args.sunlight_prob <= 1.0):
         raise ValueError("--sunlight_prob must be in [0, 1]")
+
+    if args.cuda_devices is not None:
+        if len(args.cuda_devices) == 0:
+            args.cuda_devices = None
+        else:
+            uniq = []
+            seen = set()
+            for x in args.cuda_devices:
+                if x < 0:
+                    raise ValueError("--cuda_devices must be non-negative integers")
+                if x not in seen:
+                    uniq.append(x)
+                    seen.add(x)
+            args.cuda_devices = uniq
 
     return args
 
@@ -189,6 +212,12 @@ def make_tasks(glbs_in_chunk: List[str], args) -> Tuple[List[List[Task]], str]:
     return worker_buckets, launcher_log_root
 
 
+def get_assigned_cuda_device(worker_rank: int, cuda_devices: Optional[List[int]]) -> Optional[int]:
+    if not cuda_devices:
+        return None
+    return int(cuda_devices[worker_rank % len(cuda_devices)])
+
+
 def build_blender_cmd(task: Task, args) -> List[str]:
     cmd = [
         args.blender_path,
@@ -204,6 +233,8 @@ def build_blender_cmd(task: Task, args) -> List[str]:
         str(args.resolution),
         "--render_engine",
         str(args.render_engine),
+        "--cycles_device",
+        str(args.cycles_device),
         "--traj_seed",
         str(args.traj_seed),
         "--num_cameras",
@@ -237,7 +268,12 @@ def build_blender_cmd(task: Task, args) -> List[str]:
 def worker_main(worker_rank: int, tasks: List[Task], args, tqdm_lock):
     tqdm.set_lock(tqdm_lock)
 
+    assigned_cuda = get_assigned_cuda_device(worker_rank, args.cuda_devices)
+
     desc = f"worker {worker_rank:02d}"
+    if assigned_cuda is not None:
+        desc += f" | gpu {assigned_cuda}"
+
     pbar = tqdm(
         total=len(tasks),
         desc=desc,
@@ -261,6 +297,8 @@ def worker_main(worker_rank: int, tasks: List[Task], args, tqdm_lock):
 
         if args.skip_existing and os.path.isfile(task.output_file) and os.path.getsize(task.output_file) > 0:
             with open(task.log_file, "a", encoding="utf-8") as f:
+                if assigned_cuda is not None:
+                    f.write(f"[launcher] worker_rank={worker_rank}, CUDA_VISIBLE_DEVICES={assigned_cuda}\n")
                 f.write(f"[launcher] skip existing output: {task.output_file}\n")
             num_skip += 1
             pbar.update(1)
@@ -268,18 +306,24 @@ def worker_main(worker_rank: int, tasks: List[Task], args, tqdm_lock):
 
         cmd = build_blender_cmd(task, args)
 
+        child_env = os.environ.copy()
+        if assigned_cuda is not None:
+            child_env["CUDA_VISIBLE_DEVICES"] = str(assigned_cuda)
+
         with open(task.log_file, "w", encoding="utf-8") as log_f:
             log_f.write("[launcher] CMD:\n")
             log_f.write(" ".join(cmd) + "\n\n")
+            log_f.write(f"[launcher] worker_rank={worker_rank}\n")
+            log_f.write(f"[launcher] assigned_cuda_device={assigned_cuda}\n")
+            log_f.write(f"[launcher] CUDA_VISIBLE_DEVICES={child_env.get('CUDA_VISIBLE_DEVICES', '<inherit>')}\n\n")
             log_f.flush()
-            # print(cmd)
-            # raise
+
             try:
                 result = subprocess.run(
                     cmd,
                     stdout=log_f,
                     stderr=subprocess.STDOUT,
-                    env=os.environ.copy(),
+                    env=child_env,
                     check=False,
                 )
                 if result.returncode == 0:
@@ -293,6 +337,9 @@ def worker_main(worker_rank: int, tasks: List[Task], args, tqdm_lock):
                                 "returncode": result.returncode,
                                 "task": asdict(task),
                                 "cmd": cmd,
+                                "worker_rank": worker_rank,
+                                "assigned_cuda_device": assigned_cuda,
+                                "CUDA_VISIBLE_DEVICES": child_env.get("CUDA_VISIBLE_DEVICES", None),
                             },
                             ff,
                             indent=2,
@@ -307,6 +354,9 @@ def worker_main(worker_rank: int, tasks: List[Task], args, tqdm_lock):
                             "exception": repr(e),
                             "task": asdict(task),
                             "cmd": cmd,
+                            "worker_rank": worker_rank,
+                            "assigned_cuda_device": assigned_cuda,
+                            "CUDA_VISIBLE_DEVICES": child_env.get("CUDA_VISIBLE_DEVICES", None),
                         },
                         ff,
                         indent=2,
@@ -340,12 +390,18 @@ def main():
     )
     os.makedirs(launcher_log_root, exist_ok=True)
 
+    worker_to_cuda = {
+        int(worker_rank): get_assigned_cuda_device(worker_rank, args.cuda_devices)
+        for worker_rank in range(args.num_workers)
+    }
+
     manifest = {
         "all_num_glbs": len(all_glbs),
         "selected_num_glbs": len(glbs_in_chunk),
         "selected_num_tasks": len(glbs_in_chunk),
         "args": vars(args),
         "selected_glbs": glbs_in_chunk,
+        "worker_to_cuda": worker_to_cuda,
     }
     with open(os.path.join(launcher_log_root, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
@@ -356,6 +412,8 @@ def main():
     print(f"glbs in chunk    : {len(glbs_in_chunk)}")
     print(f"total tasks      : {len(glbs_in_chunk)}")
     print(f"num workers      : {args.num_workers}")
+    print(f"cuda devices     : {args.cuda_devices if args.cuda_devices else '<inherit>'}")
+    print(f"worker->gpu      : {worker_to_cuda}")
     print(f"log root         : {launcher_log_root}")
     print("=" * 100)
 
@@ -394,17 +452,17 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 """
-python tools/submit_extract_mesh_camera_sparse_voxel.py \
+python tools/submit_extract_mesh_camera_sparse_voxel_cuda.py \
     --root_glb_dir data/objverse_minghao_4d/glbs \
-    --output_root data/objverse_minghao_4d/rendering_v5 \
+    --output_root /group/40075/yanruibin/objverse_minghao_4d_mine/rendering_v5 \
     --output_parent_suffix _static_camera_distance_v3 \
-    --worker_script tools/extract_mesh_camera_sparse_voxel_v4_interleave_light.py \
-    --blender_path /efs/yanruibin/projects/blender-4.2.1-linux-x64/blender \
-    --num_chunks 4 \
+    --worker_script tools/extract_mesh_camera_sparse_voxel_v4_interleave_light_optimized_128frame_mp4.py \
+    --blender_path /group/40034/yanruibin/projects/blender-4.2.18-linux-x64/blender \
+    --num_chunks 8 \
     --chunk_id 1 \
-    --num_workers 32 \
+    --num_workers 16 \
+    --cuda_devices 0 1 2 3 4 5 6 7\
     --resolution 1024 \
     --render_engine CYCLES \
     --transparent_bg \
@@ -417,5 +475,6 @@ python tools/submit_extract_mesh_camera_sparse_voxel.py \
     --camera_fov_min_deg 30 \
     --camera_fov_max_deg 70 \
     --camera_sensor_size 36 \
-    --sunlight_prob 0.5
+    --sunlight_prob 0.5 \
+    --extra_worker_args --cycles_backend CUDA
 """

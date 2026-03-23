@@ -1,97 +1,201 @@
-"""
-sudo yum install -y libxkbcommon
-"""
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# File: process_geometry_with_bpy.py
-# Description:
-#   1) Load an animated .glb / .gltf in Blender
-#   2) Remove root-body translation per frame by subtracting each frame's bbox center
-#   3) Rescale the whole sequence so all shapes fit inside a unit bounding box
-#   4) Render static multi-view cameras per frame
-#   5) Save one shared-topology mesh npz: faces once + per-frame vertices
-#   6) Save normalized mesh as one .ply per keyframe
-#   7) Optionally export the normalized animated scene + static cameras as a new GLB
-#   8) Optionally render the canonical scene box
-#   9) Optionally randomize camera intrinsics while keeping fovx = fovy
-#  10) Lighting (per camera):
-#        - each camera gets its own fixed lighting config
-#        - with probability sunlight_prob, use legacy sunlight exact
-#        - otherwise, use HDR environment exact, with per-camera hdr_strength sampled
-#          from [hdr_strength_min, hdr_strength_max]
-#        - record per-camera lighting into metadata
-#
-#  New camera distance logic:
-#     For each sampled view (azim/elev),
-#       - rotate all normalized mesh frames into camera-aligned space
-#       - compute a sequence-level scene box in that camera space
-#       - compute a view-specific normalization scale from that camera-space scene box
-#       - estimate tight distance from the normalized camera-space box
-#       - convert the distance back to the shared world-normalized scene
-#
-# Output layout:
-#   <prefix>_rgb/
-#       view_00/frame_0001.png
-#       view_00/frame_0002.png
-#       ...
-#       view_01/frame_0001.png
-#       ...
-#
-#   <prefix>_normal/
-#       view_00/frame_0001.png
-#       view_00/frame_0002.png
-#       ...
-#       view_01/frame_0001.png
-#       ...
-#
-#   <prefix>_mesh_ply/
-#       frame_0001.ply
-#       frame_0008.ply
-#       ...
-#
-# Example:
-# blender --background --python process_geometry_with_bpy.py -- \
-#   --object_path /path/to/model.glb \
-#   --output_file /path/to/result.json \
-#   --normalized_glb_path /path/to/result_normalized.glb \
-#   --resolution 512 \
-#   --transparent_bg \
-#   --hdr_dir data/hdr \
-#   --hdr_strength_min 0.2 \
-#   --hdr_strength_max 0.5 \
-#   --sunlight_prob 0.05 \
-#   --sunlight_energy 3.0 \
-#   --camera_frame_padding 0.01 \
-#   --camera_fit_safety 1.01 \
-#   --camera_distance_jitter_scale 1.01 \
-#   --render_scene_box \
-#   --randomize_camera_intrinsics \
-#   --camera_fov_min_deg 30 \
-#   --camera_fov_max_deg 70
+"""
+Optimized process_geometry_with_bpy.py
+
+Main optimizations compared with the previous version:
+1. Cache raw vertices during the first topology / normalization scan, so we do not
+   call Blender mesh extraction twice for the whole sequence.
+2. Use foreach_get + numpy for much faster mesh extraction.
+3. Build the HDR world node tree only once and reuse it by only swapping
+   image / strength, instead of clearing and rebuilding nodes every render.
+4. Avoid redundant lighting state updates by memoizing the active lighting signature.
+5. Add faster-by-default Cycles knobs:
+   - denoising disabled by default (enable with --cycles_use_denoising)
+   - compressed mesh saving optional (enable with --save_compressed_mesh)
+6. Add coarse timing logs for the main stages.
+7. Add motion trimming using motion_info/<chunk>/<object_id>/umeyama_similarity.json:
+   - use result[n]["rms_error"] > threshold to decide whether a frame has motion
+   - trim only head/tail contiguous no-motion frames
+   - keep middle no-motion frames
+"""
 
 import argparse
-import sys
-import os
-import math
 import json
+import math
+import os
+import sys
+import time
 from pathlib import Path
-from typing import Dict, Callable, List
+from typing import Callable, Dict, List
 
-import numpy as np
 import bpy
-from mathutils import Matrix, Vector
+import numpy as np
 from bpy_extras.object_utils import world_to_camera_view
+from mathutils import Matrix, Vector
 
 
-# =================================================================================
-#  0. DEBUG
-# =================================================================================
+# =====================================================================================
+# 0. UTILS / TIMING / DEBUG
+# =====================================================================================
 
+
+def get_cli_argv() -> List[str]:
+    argv = sys.argv
+    if "--" in argv:
+        return argv[argv.index("--") + 1 :]
+    return argv[1:]
+
+
+class StageTimer:
+    def __init__(self):
+        self.t0 = time.perf_counter()
+        self.last = self.t0
+
+    def log(self, name: str):
+        now = time.perf_counter()
+        print(f"[timing] {name}: +{now - self.last:.3f}s | total={now - self.t0:.3f}s")
+        self.last = now
+
+
+def normalize(v: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < eps:
+        return v
+    return v / n
+
+
+# ---------------------- motion trim helpers ----------------------
+
+RMS_RESULT_LIST_KEY = "results"
+
+
+def resolve_umeyama_json_path(object_path: str, motion_info_root: str) -> Path:
+    """
+    object_path: .../<chunk>/<object_id>.glb
+    json_path  : <motion_info_root>/<chunk>/<object_id>/umeyama_similarity.json
+    """
+    object_path = Path(object_path)
+    chunk_name = object_path.parent.name
+    object_id = object_path.stem
+    return Path(motion_info_root) / chunk_name / object_id / "umeyama_similarity.json"
+
+
+def load_frame_rms_from_umeyama(json_path: str):
+    """
+    Expected json format:
+    {
+      "result": [
+        {"rms_error": ...},
+        {"rms_error": ...},
+        ...
+      ]
+    }
+
+    We align result[n] with frame_indices[n].
+    """
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if RMS_RESULT_LIST_KEY not in data:
+        raise KeyError(f"Key '{RMS_RESULT_LIST_KEY}' not found in {json_path}")
+
+    result_list = data[RMS_RESULT_LIST_KEY]
+    if not isinstance(result_list, list):
+        raise TypeError(f"'{RMS_RESULT_LIST_KEY}' must be a list in {json_path}")
+
+    frame_start = data["start_frame"]
+    frame_end = data["end_frame"]
+
+    frame_indices = np.asarray(range(frame_start, frame_end + 1), dtype=np.int32)
+
+    if len(result_list) < len(frame_indices):
+        print(
+            f"Warning: len(result)={len(result_list)} < num_frames={len(frame_indices)}. "
+            f"Missing tail frames will be treated as keep."
+        )
+        raise
+
+    frame_to_rms = {}
+    num_pairs = min(len(result_list), len(frame_indices))
+    for i in range(num_pairs):
+        item = result_list[i]
+        if not isinstance(item, dict):
+            continue
+        if "rms_error" not in item:
+            continue
+        frame_to_rms[int(frame_indices[i])] = float(item["rms_error"])
+
+    return frame_to_rms, frame_indices
+
+
+def compute_trimmed_frame_range_from_umeyama(
+    frame_indices: np.ndarray,
+    frame_to_rms: dict,
+    rms_threshold: float = 0.001,
+):
+    """
+    Use rms_error > threshold as motion indicator.
+    Only trim contiguous static frames at the head/tail.
+    Middle static segments are kept.
+    Missing rms entries are treated as keep to avoid accidental deletion.
+    """
+    frame_indices = np.asarray(frame_indices, dtype=np.int32)
+
+    per_frame_rms_lookup = {}
+    per_frame_has_motion_lookup = {}
+    missing_frames = []
+
+    keep_mask = []
+    for frame in frame_indices.tolist():
+        rms = frame_to_rms.get(int(frame), None)
+
+        if rms is None:
+            per_frame_rms_lookup[int(frame)] = None
+            per_frame_has_motion_lookup[int(frame)] = None
+            keep_mask.append(True)
+            missing_frames.append(int(frame))
+        else:
+            rms = float(rms)
+            has_motion = bool(rms > float(rms_threshold))
+            per_frame_rms_lookup[int(frame)] = rms
+            per_frame_has_motion_lookup[int(frame)] = has_motion
+            keep_mask.append(has_motion)
+
+    keep_mask = np.asarray(keep_mask, dtype=bool)
+    moving_pos = np.flatnonzero(keep_mask)
+
+    if moving_pos.size == 0:
+        keep_l = 0
+        keep_r = len(frame_indices) - 1
+        trim_reason = "all_frames_static_or_missing_keep_all"
+    else:
+        keep_l = int(moving_pos[0])
+        keep_r = int(moving_pos[-1])
+        trim_reason = "trim_contiguous_static_head_tail_only"
+
+    trimmed_frame_indices = frame_indices[keep_l : keep_r + 1].copy()
+
+    return {
+        "trimmed_frame_indices": trimmed_frame_indices,
+        "per_frame_rms_lookup": per_frame_rms_lookup,
+        "per_frame_has_motion_lookup": per_frame_has_motion_lookup,
+        "keep_start_frame": int(trimmed_frame_indices[0]),
+        "keep_end_frame": int(trimmed_frame_indices[-1]),
+        "num_frames_before_trim": int(len(frame_indices)),
+        "num_frames_after_trim": int(len(trimmed_frame_indices)),
+        "num_head_frames_removed": int(keep_l),
+        "num_tail_frames_removed": int(len(frame_indices) - keep_r - 1),
+        "missing_frames_count": int(len(missing_frames)),
+        "missing_frames_example": [int(x) for x in missing_frames[:20]],
+        "trim_reason": trim_reason,
+    }
+
+
+# Optional debug helpers.
 def debug_project_world_points(cam_obj, points_world: np.ndarray, title: str = ""):
     scene = bpy.context.scene
-
     xs, ys, zs = [], [], []
     print(f"Projected points for camera: {cam_obj.name} | {title}")
     for i, p in enumerate(points_world):
@@ -107,27 +211,9 @@ def debug_project_world_points(cam_obj, points_world: np.ndarray, title: str = "
     print(f"z range: [{min(zs):.6f}, {max(zs):.6f}]")
 
 
-def debug_project_bbox_corners(cam_obj, bbox_min, bbox_max):
-    corners = get_bbox_corners(
-        np.asarray(bbox_min, dtype=np.float32),
-        np.asarray(bbox_max, dtype=np.float32),
-    )
-    debug_project_world_points(cam_obj, corners, title="world canonical bbox")
-
-
-def debug_project_camera_space_bbox(cam_obj, bbox_min_cam, bbox_max_cam, azim: float, elev: float):
-    corners_world = camera_aligned_bbox_corners_to_world(
-        np.asarray(bbox_min_cam, dtype=np.float32),
-        np.asarray(bbox_max_cam, dtype=np.float32),
-        azim=azim,
-        elev=elev,
-    )
-    debug_project_world_points(cam_obj, corners_world, title="camera-space sequence bbox mapped to world")
-
-
-# =================================================================================
-#  1. BASIC HELPERS
-# =================================================================================
+# =====================================================================================
+# 1. SCENE / CAMERA HELPERS
+# =====================================================================================
 
 IMPORT_FUNCTIONS: Dict[str, Callable] = {
     "glb": bpy.ops.import_scene.gltf,
@@ -135,25 +221,31 @@ IMPORT_FUNCTIONS: Dict[str, Callable] = {
 }
 
 
-def get_cli_argv():
-    argv = sys.argv
-    if "--" in argv:
-        return argv[argv.index("--") + 1:]
-    return argv[1:]
-
-
 def init_scene() -> None:
     for obj in list(bpy.data.objects):
         bpy.data.objects.remove(obj, do_unlink=True)
+    for collection in list(bpy.data.collections):
+        if collection.users == 0:
+            bpy.data.collections.remove(collection)
     for material in list(bpy.data.materials):
-        bpy.data.materials.remove(material, do_unlink=True)
+        if material.users == 0:
+            bpy.data.materials.remove(material, do_unlink=True)
     for texture in list(bpy.data.textures):
-        bpy.data.textures.remove(texture, do_unlink=True)
+        if texture.users == 0:
+            bpy.data.textures.remove(texture, do_unlink=True)
     for image in list(bpy.data.images):
-        bpy.data.images.remove(image, do_unlink=True)
+        if image.users == 0:
+            bpy.data.images.remove(image, do_unlink=True)
     for mesh in list(bpy.data.meshes):
         if mesh.users == 0:
             bpy.data.meshes.remove(mesh, do_unlink=True)
+    for world in list(bpy.data.worlds):
+        if world.users == 0:
+            bpy.data.worlds.remove(world, do_unlink=True)
+    try:
+        bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+    except Exception:
+        pass
 
 
 def load_object(object_path: str) -> None:
@@ -163,57 +255,11 @@ def load_object(object_path: str) -> None:
     IMPORT_FUNCTIONS[file_extension](filepath=object_path)
 
 
-def remove_all_light_objects():
-    removed = []
-    for obj in list(bpy.context.scene.objects):
-        if obj.type == "LIGHT":
-            removed.append(obj.name)
-            bpy.data.objects.remove(obj, do_unlink=True)
-    if len(removed) > 0:
-        print(f"Removed imported light objects: {removed}")
-    return removed
-
-
-def summarize_existing_light_objects():
-    infos = []
-    for obj in bpy.context.scene.objects:
-        if obj.type != "LIGHT":
-            continue
-        light_type = None
-        light_energy = None
-        if getattr(obj, "data", None) is not None:
-            light_type = getattr(obj.data, "type", None)
-            light_energy = getattr(obj.data, "energy", None)
-        infos.append({
-            "name": obj.name,
-            "light_type": str(light_type) if light_type is not None else None,
-            "energy": float(light_energy) if light_energy is not None else None,
-            "hide_render": bool(obj.hide_render),
-            "hide_viewport": bool(obj.hide_viewport),
-        })
-    return infos
-
-
-def normalize(v, eps=1e-8):
-    n = np.linalg.norm(v)
-    if n < eps:
-        return v
-    return v / n
-
-
 def look_at(
     cam_pos: np.ndarray,
     target: np.ndarray,
     up=np.array([0.0, 0.0, 1.0], dtype=np.float32),
 ):
-    """
-    Return cam2world whose columns are:
-      x-axis = right
-      y-axis = up
-      z-axis = camera local +Z
-
-    Blender camera looks toward local -Z, so we store -forward in the 3rd column.
-    """
     forward = normalize(target - cam_pos)
     right = normalize(np.cross(forward, up))
     if np.linalg.norm(right) < 1e-6:
@@ -254,11 +300,6 @@ def set_camera_from_cam2world(cam_obj, cam2world: np.ndarray):
 
 
 def set_camera_intrinsics_from_fov(cam_obj, fov_deg: float, sensor_size: float = 36.0):
-    """
-    通过设置单一 FOV 来随机相机内参，并保持:
-      - sensor_width = sensor_height
-      - 因此在正方形输出分辨率下，fovx = fovy
-    """
     fov_deg = float(np.clip(fov_deg, 1.0, 179.0))
     fov_rad = math.radians(fov_deg)
 
@@ -273,12 +314,7 @@ def set_camera_intrinsics_from_fov(cam_obj, fov_deg: float, sensor_size: float =
 
 
 def get_camera_intrinsics_dict(cam_obj, resolution: int):
-    """
-    从 Blender camera 读出等价内参信息。
-    注意这里默认输出是 resolution x resolution 的正方形图像。
-    """
     cam_data = cam_obj.data
-
     angle_x = float(cam_data.angle_x)
     angle_y = float(cam_data.angle_y)
 
@@ -301,19 +337,17 @@ def get_camera_intrinsics_dict(cam_obj, resolution: int):
     }
 
 
-# =================================================================================
-#  2. GEOMETRY EXTRACTION
-# =================================================================================
+# =====================================================================================
+# 2. FAST GEOMETRY EXTRACTION
+# =====================================================================================
 
-def extract_merged_mesh_world(mesh_objs):
-    """
-    提取当前帧所有 mesh，并合并成一个 world-space mesh。
 
-    Returns:
-        merged_vertices: np.ndarray [N, 3], float32
-        merged_faces: np.ndarray [F, 3], int32
+def extract_merged_mesh_world_fast(mesh_objs, depsgraph=None):
     """
-    depsgraph = bpy.context.evaluated_depsgraph_get()
+    Faster version using foreach_get + numpy. Returns merged world-space vertices / faces.
+    """
+    if depsgraph is None:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
 
     all_vertices = []
     all_faces = []
@@ -325,33 +359,41 @@ def extract_merged_mesh_world(mesh_objs):
 
         obj_eval = obj.evaluated_get(depsgraph)
         temp_mesh = obj_eval.to_mesh()
-
         if temp_mesh is None:
             continue
 
-        temp_mesh.calc_loop_triangles()
+        try:
+            temp_mesh.calc_loop_triangles()
+            num_verts = len(temp_mesh.vertices)
+            num_tris = len(temp_mesh.loop_triangles)
+            if num_verts == 0 or num_tris == 0:
+                continue
 
-        if len(temp_mesh.vertices) == 0 or len(temp_mesh.loop_triangles) == 0:
+            co = np.empty(num_verts * 3, dtype=np.float32)
+            temp_mesh.vertices.foreach_get("co", co)
+            co = co.reshape(num_verts, 3)
+
+            tri = np.empty(num_tris * 3, dtype=np.int32)
+            temp_mesh.loop_triangles.foreach_get("vertices", tri)
+            tri = tri.reshape(num_tris, 3)
+
+            world_mat = obj_eval.matrix_world.copy()
+            R = np.array(world_mat.to_3x3(), dtype=np.float32)
+            t = np.array(world_mat.translation[:], dtype=np.float32)
+            verts_world = co @ R.T + t[None, :]
+
+            all_vertices.append(verts_world)
+            all_faces.append(tri + vert_offset)
+            vert_offset += num_verts
+        finally:
             obj_eval.to_mesh_clear()
-            continue
-
-        world_mat = obj_eval.matrix_world.copy()
-
-        verts = np.array([world_mat @ v.co for v in temp_mesh.vertices], dtype=np.float32)
-        faces = np.array([lt.vertices[:] for lt in temp_mesh.loop_triangles], dtype=np.int32)
-
-        all_vertices.append(verts)
-        all_faces.append(faces + vert_offset)
-        vert_offset += len(verts)
-
-        obj_eval.to_mesh_clear()
 
     if len(all_vertices) == 0:
         raise RuntimeError("No valid mesh found in current frame.")
 
     merged_vertices = np.concatenate(all_vertices, axis=0)
     merged_faces = np.concatenate(all_faces, axis=0)
-    return merged_vertices, merged_faces
+    return merged_vertices.astype(np.float32, copy=False), merged_faces.astype(np.int32, copy=False)
 
 
 def compute_bbox_center(vertices_world: np.ndarray):
@@ -361,32 +403,19 @@ def compute_bbox_center(vertices_world: np.ndarray):
 
 
 def collect_keyframe_frames(frame_start: int, frame_end: int) -> List[int]:
-    """
-    从所有 action / fcurve 中提取真实关键帧编号。
-    只保留 [frame_start, frame_end] 范围内的整帧。
-    """
     keyframes = set()
-
     for action in bpy.data.actions:
         for fcurve in action.fcurves:
             for kp in fcurve.keyframe_points:
                 frame = int(round(float(kp.co.x)))
                 if frame_start <= frame <= frame_end:
                     keyframes.add(frame)
-
-    keyframes = sorted(keyframes)
-    return keyframes
+    return sorted(keyframes)
 
 
 def save_mesh_as_ply(vertices: np.ndarray, faces: np.ndarray, ply_path: str):
-    """
-    保存三角 mesh 为 binary little endian PLY。
-    vertices: [N, 3], float32/float16/float64
-    faces:    [F, 3], int32/int64
-    """
     vertices = np.asarray(vertices, dtype=np.float32)
     faces = np.asarray(faces, dtype=np.int32)
-
     os.makedirs(os.path.dirname(ply_path) or ".", exist_ok=True)
 
     header = (
@@ -403,29 +432,20 @@ def save_mesh_as_ply(vertices: np.ndarray, faces: np.ndarray, ply_path: str):
 
     with open(ply_path, "wb") as f:
         f.write(header.encode("ascii"))
-
         vertices.astype("<f4", copy=False).tofile(f)
-
-        face_dtype = np.dtype([
-            ("count", "u1"),
-            ("idx", "<i4", (3,)),
-        ])
+        face_dtype = np.dtype([("count", "u1"), ("idx", "<i4", (3,))])
         face_data = np.empty(len(faces), dtype=face_dtype)
         face_data["count"] = 3
         face_data["idx"] = faces.astype("<i4", copy=False)
         face_data.tofile(f)
 
 
-# =================================================================================
-#  3. SEQUENCE NORMALIZATION
-# =================================================================================
+# =====================================================================================
+# 3. SEQUENCE NORMALIZATION + RAW CACHE
+# =====================================================================================
+
 
 def create_sequence_normalizer():
-    """
-    创建一个空物体作为额外父节点。
-    后续逐帧设置其 scale / translation，实现：
-        x' = s * (x - center_t)
-    """
     root_objs = [obj for obj in bpy.context.scene.objects.values() if not obj.parent]
     if len(root_objs) == 0:
         raise RuntimeError("No root objects found in the scene.")
@@ -446,24 +466,34 @@ def create_sequence_normalizer():
     return normalizer
 
 
-def compute_sequence_normalization_params(mesh_objs, frame_indices: np.ndarray):
+def compute_sequence_normalization_params_and_cache(
+    mesh_objs,
+    frame_indices: np.ndarray,
+    cache_raw_vertices: bool = True,
+    raw_cache_dtype=np.float16,
+):
     """
-    第一遍扫描序列：
-      1) 检查拓扑是否一致
-      2) 计算每帧 bbox center
-      3) 统计去平移后的全序列 bbox，用于求全局 scale
+    First pass only:
+      1) check shared topology
+      2) compute per-frame bbox centers
+      3) compute canonical bbox after removing per-frame translation
+      4) optionally cache raw vertices so we never extract them again
     """
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+
     shared_faces = None
     centers_seq = []
+    raw_vertices_cache = [] if cache_raw_vertices else None
 
     global_min = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
     global_max = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float32)
 
     for i in frame_indices:
-        bpy.context.scene.frame_set(int(i))
+        scene.frame_set(int(i))
         bpy.context.view_layer.update()
 
-        raw_vertices, raw_faces = extract_merged_mesh_world(mesh_objs)
+        raw_vertices, raw_faces = extract_merged_mesh_world_fast(mesh_objs, depsgraph=depsgraph)
 
         if shared_faces is None:
             shared_faces = raw_faces.copy()
@@ -475,8 +505,7 @@ def compute_sequence_normalization_params(mesh_objs, frame_indices: np.ndarray):
             if raw_faces.shape != shared_faces.shape or not np.array_equal(raw_faces, shared_faces):
                 raise RuntimeError(
                     f"Topology changed at frame {int(i)}. "
-                    f"Cannot store one shared face array for all frames. "
-                    f"Reference faces shape={shared_faces.shape}, current faces shape={raw_faces.shape}"
+                    f"Reference faces shape={shared_faces.shape}, current faces shape={raw_faces.shape}."
                 )
 
         center = compute_bbox_center(raw_vertices).astype(np.float32)
@@ -485,6 +514,9 @@ def compute_sequence_normalization_params(mesh_objs, frame_indices: np.ndarray):
         centered = raw_vertices - center[None, :]
         global_min = np.minimum(global_min, centered.min(axis=0))
         global_max = np.maximum(global_max, centered.max(axis=0))
+
+        if cache_raw_vertices:
+            raw_vertices_cache.append(raw_vertices.astype(raw_cache_dtype))
 
     centers_seq = np.stack(centers_seq, axis=0)
     shared_faces = np.asarray(shared_faces, dtype=np.int32)
@@ -496,17 +528,19 @@ def compute_sequence_normalization_params(mesh_objs, frame_indices: np.ndarray):
     canonical_bbox_min = (global_min * sequence_scale).astype(np.float32)
     canonical_bbox_max = (global_max * sequence_scale).astype(np.float32)
 
-    return shared_faces, centers_seq, sequence_scale, canonical_bbox_min, canonical_bbox_max
+    return (
+        shared_faces,
+        centers_seq,
+        sequence_scale,
+        canonical_bbox_min,
+        canonical_bbox_max,
+        raw_vertices_cache,
+    )
 
 
 def apply_sequence_normalization(normalizer_obj, frame_center: np.ndarray, global_scale: float):
-    """
-    对当前帧应用：
-        x' = global_scale * (x - frame_center)
-    """
     normalizer_obj.scale = (global_scale, global_scale, global_scale)
     normalizer_obj.location = tuple((-global_scale * frame_center).tolist())
-    bpy.context.view_layer.update()
 
 
 def bake_sequence_normalization_to_keyframes(
@@ -515,9 +549,6 @@ def bake_sequence_normalization_to_keyframes(
     centers_seq: np.ndarray,
     global_scale: float,
 ):
-    """
-    把逐帧 normalization 烘焙到 normalizer 的 keyframes 上，方便导出成带动画的 GLB。
-    """
     scene = bpy.context.scene
     current_frame = scene.frame_current
 
@@ -529,12 +560,8 @@ def bake_sequence_normalization_to_keyframes(
 
     for local_frame_idx, source_frame in enumerate(frame_indices):
         scene.frame_set(int(source_frame))
-
         normalizer_obj.scale = (global_scale, global_scale, global_scale)
-        normalizer_obj.location = tuple(
-            (-global_scale * centers_seq[local_frame_idx]).tolist()
-        )
-
+        normalizer_obj.location = tuple((-global_scale * centers_seq[local_frame_idx]).tolist())
         normalizer_obj.keyframe_insert(data_path="location", frame=int(source_frame))
         normalizer_obj.keyframe_insert(data_path="scale", frame=int(source_frame))
 
@@ -547,74 +574,92 @@ def bake_sequence_normalization_to_keyframes(
     bpy.context.view_layer.update()
 
 
-def precompute_normalized_mesh_sequence(
-    mesh_objs,
-    frame_indices: np.ndarray,
-    normalizer_obj,
+def precompute_normalized_mesh_sequence_from_cache(
+    raw_vertices_cache: List[np.ndarray],
     centers_seq: np.ndarray,
     global_scale: float,
     shared_faces: np.ndarray,
+    frame_indices: np.ndarray,
     export_keyframe_ply: bool = False,
     keyframe_frame_set=None,
     mesh_ply_dir: str = "",
 ):
-    """
-    第二遍扫描序列：
-      - 应用全局 world normalization
-      - 提取每帧 normalized vertices
-      - 可选导出 keyframe ply
-
-    返回:
-      vertices_seq_list: List[np.ndarray], each [N,3], float16
-      keyframe_ply_records: dict(frame_int -> ply_path)
-    """
     from tqdm import tqdm
 
+    if raw_vertices_cache is None:
+        raise RuntimeError("raw_vertices_cache is None. Enable cache_raw_vertices to use optimized precompute path.")
     if keyframe_frame_set is None:
         keyframe_frame_set = set()
 
-    vertices_seq_list = []
+    num_frames = len(raw_vertices_cache)
+    num_vertices = raw_vertices_cache[0].shape[0]
+    vertices_seq = np.empty((num_frames, num_vertices, 3), dtype=np.float16)
     keyframe_ply_records = {}
 
-    for local_frame_idx, source_frame in enumerate(tqdm(frame_indices, desc="Precomputing normalized mesh sequence")):
-        frame_int = int(source_frame)
-        bpy.context.scene.frame_set(frame_int)
+    for local_frame_idx, raw_vertices in enumerate(tqdm(raw_vertices_cache, desc="Normalizing cached mesh sequence")):
+        raw32 = np.asarray(raw_vertices, dtype=np.float32)
+        norm_vertices = ((raw32 - centers_seq[local_frame_idx][None, :]) * global_scale).astype(np.float32)
+        vertices_seq[local_frame_idx] = norm_vertices.astype(np.float16)
 
-        apply_sequence_normalization(
-            normalizer_obj,
-            frame_center=centers_seq[local_frame_idx],
-            global_scale=global_scale,
-        )
-        bpy.context.view_layer.update()
-
-        norm_vertices, norm_faces = extract_merged_mesh_world(mesh_objs)
-        if norm_faces.shape != shared_faces.shape or not np.array_equal(norm_faces, shared_faces):
-            raise RuntimeError(
-                f"Topology unexpectedly changed after normalization at frame {frame_int}."
-            )
-
-        vertices_seq_list.append(norm_vertices.astype(np.float16))
-
+        frame_int = int(frame_indices[local_frame_idx])
         if export_keyframe_ply and (frame_int in keyframe_frame_set):
             mesh_ply_path = os.path.join(mesh_ply_dir, f"frame_{frame_int:04d}.ply")
             save_mesh_as_ply(norm_vertices, shared_faces, mesh_ply_path)
             keyframe_ply_records[frame_int] = mesh_ply_path
 
-    return vertices_seq_list, keyframe_ply_records
+    return vertices_seq, keyframe_ply_records
 
 
-# =================================================================================
-#  4. RENDERING / LIGHTING
-# =================================================================================
+# =====================================================================================
+# 4. RENDERING / LIGHTING
+# =====================================================================================
 
-def enable_cycles_acceleration(backend: str = "CUDA"):
+
+def enable_cycles_device(device: str = "GPU", backend: str = "CUDA"):
+    """
+    device:
+        - "GPU": use GPU backend (CUDA / OPTIX)
+        - "CPU": force CPU rendering, do not require GPU discovery
+    """
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
 
-    prefs = bpy.context.preferences.addons["cycles"].preferences
-    backend = backend.upper()
-    prefs.compute_device_type = backend
+    device = str(device).upper()
+    backend = str(backend).upper()
 
+    prefs = bpy.context.preferences.addons["cycles"].preferences
+
+    if device == "CPU":
+        # 强制只用 CPU
+        try:
+            prefs.compute_device_type = "NONE"
+        except Exception:
+            pass
+
+        try:
+            prefs.refresh_devices()
+        except AttributeError:
+            try:
+                prefs.get_devices()
+            except Exception:
+                pass
+
+        for d in getattr(prefs, "devices", []):
+            d.use = (d.type == "CPU")
+            print(f"  name={d.name}, type={d.type}, use={d.use}")
+
+        scene.cycles.device = "CPU"
+        print("=== Cycles device setup ===")
+        print("Requested device: CPU")
+        print("scene.render.engine =", scene.render.engine)
+        print("scene.cycles.device =", scene.cycles.device)
+        return
+
+    if device != "GPU":
+        raise ValueError(f"Unsupported cycles device: {device}. Expected 'CPU' or 'GPU'.")
+
+    # GPU 模式
+    prefs.compute_device_type = backend
     try:
         prefs.refresh_devices()
     except AttributeError:
@@ -622,8 +667,8 @@ def enable_cycles_acceleration(backend: str = "CUDA"):
 
     found_gpu = False
     print("=== Cycles device discovery ===")
+    print("Requested device:", device)
     print("Requested backend:", backend)
-
     for d in prefs.devices:
         d.use = (d.type != "CPU")
         print(f"  name={d.name}, type={d.type}, use={d.use}")
@@ -631,7 +676,6 @@ def enable_cycles_acceleration(backend: str = "CUDA"):
             found_gpu = True
 
     scene.cycles.device = "GPU"
-
     print("scene.render.engine =", scene.render.engine)
     print("scene.cycles.device =", scene.cycles.device)
     print("prefs.compute_device_type =", prefs.compute_device_type)
@@ -639,37 +683,38 @@ def enable_cycles_acceleration(backend: str = "CUDA"):
     if not found_gpu:
         raise RuntimeError(
             f"No usable GPU found for Cycles backend={backend}. "
-            f"Try backend='CUDA', check nvidia-smi, and verify Blender can see the GPU."
+            f"Try backend='CUDA' or 'OPTIX', or switch to --cycles_device CPU."
         )
 
 
 def setup_renderer(
     resolution=512,
     engine="BLENDER_EEVEE",
-    transparent_bg=True
+    transparent_bg=True,
+    cycles_samples: int = 64,
+    cycles_use_denoising: bool = False,
+    cycles_use_adaptive_sampling: bool = True,
+    cycles_device: str = "GPU",
 ):
     scene = bpy.context.scene
     scene.render.engine = engine
-
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.resolution_percentage = 100
-
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGBA" if transparent_bg else "RGB"
     scene.render.film_transparent = transparent_bg
     scene.render.use_file_extension = True
 
     if engine == "CYCLES":
-        scene.cycles.device = "GPU"
-        scene.cycles.samples = 64
-        scene.cycles.use_denoising = True
+        scene.cycles.device = str(cycles_device).upper()
+        scene.cycles.samples = int(cycles_samples)
+        scene.cycles.use_denoising = bool(cycles_use_denoising)
         if hasattr(scene.cycles, "use_adaptive_sampling"):
-            scene.cycles.use_adaptive_sampling = True
-
+            scene.cycles.use_adaptive_sampling = bool(cycles_use_adaptive_sampling)
     elif engine == "BLENDER_EEVEE":
         if hasattr(scene.eevee, "taa_render_samples"):
-            scene.eevee.taa_render_samples = 64
+            scene.eevee.taa_render_samples = int(cycles_samples)
 
 
 def create_sun_light(name="SunLight", energy=3.0):
@@ -677,7 +722,6 @@ def create_sun_light(name="SunLight", energy=3.0):
     light_data.energy = float(energy)
     light_obj = bpy.data.objects.new(name, light_data)
     bpy.context.scene.collection.objects.link(light_obj)
-
     light_obj.location = (2.0, -2.0, 3.0)
     light_obj.rotation_euler = (math.radians(35.0), 0.0, math.radians(45.0))
     return light_obj
@@ -711,17 +755,13 @@ def list_hdr_files(hdr_dir: str):
             if not p.is_file():
                 continue
             name = p.name
-            # 跳过 macOS AppleDouble 文件，以及其他隐藏文件
             if name.startswith("._") or name.startswith("."):
                 continue
             hdr_files.append(p.resolve())
 
     hdr_files = sorted(set(hdr_files))
     if len(hdr_files) == 0:
-        raise RuntimeError(
-            f"No valid HDR files (*.exr / *.hdr) found in directory: {hdr_dir}"
-        )
-
+        raise RuntimeError(f"No valid HDR files (*.exr / *.hdr) found in directory: {hdr_dir}")
     return hdr_files
 
 
@@ -733,12 +773,10 @@ def duplicate_world_or_none(world, new_name: str):
     return world_copy
 
 
-def configure_world_as_hdr(world_obj, hdr_path: str, hdr_strength: float):
-    if world_obj is None:
-        raise RuntimeError("HDR world object is None.")
-
-    world_obj.use_nodes = True
-    nt = world_obj.node_tree
+def build_reusable_hdr_world(name: str = "PerCameraHDRWorld"):
+    hdr_world = bpy.data.worlds.new(name)
+    hdr_world.use_nodes = True
+    nt = hdr_world.node_tree
     nodes = nt.nodes
     links = nt.links
     nodes.clear()
@@ -755,45 +793,41 @@ def configure_world_as_hdr(world_obj, hdr_path: str, hdr_strength: float):
     node_bg.location = (-100, 0)
     node_out.location = (150, 0)
 
-    node_env.image = bpy.data.images.load(str(hdr_path), check_existing=True)
-    node_bg.inputs["Strength"].default_value = float(hdr_strength)
-
     links.new(node_texcoord.outputs["Generated"], node_mapping.inputs["Vector"])
     links.new(node_mapping.outputs["Vector"], node_env.inputs["Vector"])
     links.new(node_env.outputs["Color"], node_bg.inputs["Color"])
     links.new(node_bg.outputs["Background"], node_out.inputs["Surface"])
 
+    return hdr_world, node_env, node_bg
 
-def create_per_camera_lighting_controller(scene, sunlight_energy: float):
-    """
-    构造一个 lighting controller，用于在 render 时在不同 camera lighting 之间切换。
 
-    目标：
-      - sunlight: 复刻 legacy 行为
-          * 恢复原始 world
-          * 恢复 imported lights 的原始可见性
-          * 仅额外启用一盏 SunLight
-      - HDR: 复刻 new HDR 行为
-          * 禁用 imported lights
-          * 禁用额外 SunLight
-          * 使用单独的 HDR world
-    """
+def preload_hdr_images_for_configs(per_camera_lighting: List[dict]):
+    unique_paths = sorted({cfg["selected_hdr_map"] for cfg in per_camera_lighting if cfg["selected_hdr_map"] is not None})
+    image_cache = {}
+    for p in unique_paths:
+        image_cache[p] = bpy.data.images.load(str(p), check_existing=True)
+    return image_cache
+
+
+def create_per_camera_lighting_controller(scene, sunlight_energy: float, per_camera_lighting: List[dict]):
     imported_lights = []
     for obj in scene.objects:
         if obj.type != "LIGHT":
             continue
-        imported_lights.append({
-            "obj": obj,
-            "name": obj.name,
-            "light_type": str(getattr(obj.data, "type", None)) if getattr(obj, "data", None) is not None else None,
-            "energy": float(getattr(obj.data, "energy", 0.0)) if getattr(obj, "data", None) is not None else None,
-            "hide_render": bool(obj.hide_render),
-            "hide_viewport": bool(obj.hide_viewport),
-        })
+        imported_lights.append(
+            {
+                "obj": obj,
+                "name": obj.name,
+                "light_type": str(getattr(obj.data, "type", None)) if getattr(obj, "data", None) is not None else None,
+                "energy": float(getattr(obj.data, "energy", 0.0)) if getattr(obj, "data", None) is not None else None,
+                "hide_render": bool(obj.hide_render),
+                "hide_viewport": bool(obj.hide_viewport),
+            }
+        )
 
     legacy_world = duplicate_world_or_none(scene.world, "LegacyLightingWorldCopy")
-    hdr_world = bpy.data.worlds.new("PerCameraHDRWorld")
-    hdr_world.use_nodes = True
+    hdr_world, hdr_env_node, hdr_bg_node = build_reusable_hdr_world()
+    hdr_image_cache = preload_hdr_images_for_configs(per_camera_lighting)
 
     dedicated_sun = create_sun_light(name="PerCameraSunLight", energy=float(sunlight_energy))
     dedicated_sun.hide_render = True
@@ -802,6 +836,9 @@ def create_per_camera_lighting_controller(scene, sunlight_energy: float):
     controller = {
         "legacy_world": legacy_world,
         "hdr_world": hdr_world,
+        "hdr_env_node": hdr_env_node,
+        "hdr_bg_node": hdr_bg_node,
+        "hdr_image_cache": hdr_image_cache,
         "dedicated_sun": dedicated_sun,
         "imported_lights": imported_lights,
         "imported_lights_summary": [
@@ -814,6 +851,7 @@ def create_per_camera_lighting_controller(scene, sunlight_energy: float):
             }
             for x in imported_lights
         ],
+        "active_signature": None,
     }
     return controller
 
@@ -827,14 +865,9 @@ def sample_per_camera_lighting_configs(
     hdr_strength_min: float = 0.2,
     hdr_strength_max: float = 0.5,
 ):
-    """
-    为每个 camera 采样一套固定 lighting config。
-    这些 config 在整个序列中保持不变。
-    """
     sunlight_prob = float(np.clip(sunlight_prob, 0.0, 1.0))
     hdr_strength_min = float(hdr_strength_min)
     hdr_strength_max = float(hdr_strength_max)
-
     if hdr_strength_min > hdr_strength_max:
         raise ValueError("hdr_strength_min must be <= hdr_strength_max")
 
@@ -844,25 +877,21 @@ def sample_per_camera_lighting_configs(
     configs = []
     for view_idx in range(num_cameras):
         use_sunlight = bool(rng.random() < sunlight_prob)
-
         if use_sunlight:
             config = {
                 "view_index": int(view_idx),
                 "lighting_type": "sunlight",
                 "lighting_seed": int(seed),
                 "lighting_compatibility_mode": "legacy_sunlight_exact_per_camera",
-
                 "sunlight_prob": float(sunlight_prob),
                 "sunlight_energy": float(sunlight_energy),
                 "sunlight_name": "PerCameraSunLight",
-
                 "hdr_dir": str(Path(hdr_dir).resolve()),
                 "selected_hdr_index": None,
                 "selected_hdr_map": None,
                 "selected_hdr_basename": None,
                 "num_available_hdr_maps": int(len(hdr_files)),
                 "hdr_strength": None,
-
                 "imported_lights_enabled": True,
                 "world_mode": "legacy_world_copy",
             }
@@ -870,49 +899,54 @@ def sample_per_camera_lighting_configs(
             chosen_idx = int(rng.integers(low=0, high=len(hdr_files)))
             chosen_hdr = hdr_files[chosen_idx]
             sampled_strength = float(rng.uniform(hdr_strength_min, hdr_strength_max))
-
             config = {
                 "view_index": int(view_idx),
                 "lighting_type": "random_hdr_environment_map",
                 "lighting_seed": int(seed),
                 "lighting_compatibility_mode": "new_hdr_exact_per_camera",
-
                 "sunlight_prob": float(sunlight_prob),
                 "sunlight_energy": None,
                 "sunlight_name": None,
-
                 "hdr_dir": str(Path(hdr_dir).resolve()),
                 "selected_hdr_index": int(chosen_idx),
                 "selected_hdr_map": str(chosen_hdr),
                 "selected_hdr_basename": chosen_hdr.name,
                 "num_available_hdr_maps": int(len(hdr_files)),
                 "hdr_strength": float(sampled_strength),
-
                 "imported_lights_enabled": False,
                 "world_mode": "per_camera_hdr_world",
             }
-
         configs.append(config)
 
     return configs
 
 
+def lighting_signature(lighting_config: dict):
+    if lighting_config["lighting_type"] == "sunlight":
+        return ("sunlight", float(lighting_config["sunlight_energy"]))
+    return (
+        "hdr",
+        str(lighting_config["selected_hdr_map"]),
+        round(float(lighting_config["hdr_strength"]), 6),
+    )
+
+
 def apply_per_camera_lighting(scene, lighting_controller, lighting_config):
-    """
-    根据当前 view 的 lighting_config，把 scene 切换到对应 lighting。
-    """
+    sig = lighting_signature(lighting_config)
+    if lighting_controller["active_signature"] == sig:
+        return
+
     dedicated_sun = lighting_controller["dedicated_sun"]
     imported_lights = lighting_controller["imported_lights"]
     legacy_world = lighting_controller["legacy_world"]
     hdr_world = lighting_controller["hdr_world"]
+    hdr_env_node = lighting_controller["hdr_env_node"]
+    hdr_bg_node = lighting_controller["hdr_bg_node"]
+    hdr_image_cache = lighting_controller["hdr_image_cache"]
 
     lighting_type = lighting_config["lighting_type"]
-
     if lighting_type == "sunlight":
-        # 恢复 legacy world
         scene.world = legacy_world
-
-        # 恢复 imported lights 的原始状态
         for info in imported_lights:
             obj = info["obj"]
             if obj.name not in bpy.data.objects:
@@ -920,35 +954,29 @@ def apply_per_camera_lighting(scene, lighting_controller, lighting_config):
             obj.hide_render = bool(info["hide_render"])
             obj.hide_viewport = bool(info["hide_viewport"])
 
-        # 启用 dedicated sunlight
         dedicated_sun.data.energy = float(lighting_config["sunlight_energy"])
         dedicated_sun.hide_render = False
         dedicated_sun.hide_viewport = False
 
     elif lighting_type == "random_hdr_environment_map":
-        # 禁用 imported lights
         for info in imported_lights:
             obj = info["obj"]
             if obj.name not in bpy.data.objects:
                 continue
             obj.hide_render = True
+            obj.hide_viewport = True
 
-        # 禁用 dedicated sunlight
         dedicated_sun.hide_render = True
         dedicated_sun.hide_viewport = True
 
-        # 切到 HDR world
-        configure_world_as_hdr(
-            hdr_world,
-            hdr_path=lighting_config["selected_hdr_map"],
-            hdr_strength=float(lighting_config["hdr_strength"]),
-        )
+        hdr_path = str(lighting_config["selected_hdr_map"])
+        hdr_env_node.image = hdr_image_cache[hdr_path]
+        hdr_bg_node.inputs["Strength"].default_value = float(lighting_config["hdr_strength"])
         scene.world = hdr_world
-
     else:
         raise ValueError(f"Unknown lighting_type: {lighting_type}")
 
-    bpy.context.view_layer.update()
+    lighting_controller["active_signature"] = sig
 
 
 def render_frame(output_path: str):
@@ -958,13 +986,8 @@ def render_frame(output_path: str):
 
 
 def setup_normal_output(normal_root_dir: str):
-    """
-    用 compositor 把 normal pass 输出到 PNG。
-    返回 file_output node，后续每次 render 前动态改 base_path / prefix。
-    """
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
-
     view_layer.use_pass_normal = True
 
     scene.use_nodes = True
@@ -1005,7 +1028,6 @@ def setup_normal_output(normal_root_dir: str):
     file_output = nodes.new(type="CompositorNodeOutputFile")
     file_output.location = (550, -80)
     file_output.base_path = normal_root_dir
-
     slot = file_output.file_slots[0]
     slot.path = "frame_"
     slot.use_node_format = True
@@ -1016,7 +1038,6 @@ def setup_normal_output(normal_root_dir: str):
     file_output.format.color_depth = "16"
 
     links.new(set_alpha.outputs["Image"], file_output.inputs[0])
-
     print(f"Normal output is enabled. Files will be written under: {normal_root_dir}")
     return file_output
 
@@ -1028,14 +1049,7 @@ def update_normal_output_path(file_output_node, base_dir: str, prefix: str):
 
 
 def export_normalized_scene_as_glb(output_glb_path: str):
-    """
-    导出当前场景为 GLB，包含：
-      - 原始动画对象
-      - baked 后的 SequenceNormalizer 动画
-      - 静态 cameras
-    """
     os.makedirs(os.path.dirname(output_glb_path) or ".", exist_ok=True)
-
     bpy.ops.export_scene.gltf(
         filepath=output_glb_path,
         export_format="GLB",
@@ -1047,14 +1061,12 @@ def export_normalized_scene_as_glb(output_glb_path: str):
         export_force_sampling=True,
         export_apply=False,
     )
-
     print(f"Normalized animated scene + cameras exported to: {output_glb_path}")
 
 
 def create_emission_material(name: str, color=(1.0, 0.2, 0.2, 1.0), strength: float = 1.5):
     mat = bpy.data.materials.new(name=name)
     mat.use_nodes = True
-
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
     nodes.clear()
@@ -1066,9 +1078,20 @@ def create_emission_material(name: str, color=(1.0, 0.2, 0.2, 1.0), strength: fl
 
     output = nodes.new(type="ShaderNodeOutputMaterial")
     output.location = (220, 0)
-
     links.new(emission.outputs["Emission"], output.inputs["Surface"])
     return mat
+
+
+def get_bbox_corners(bbox_min: np.ndarray, bbox_max: np.ndarray):
+    x0, y0, z0 = bbox_min.tolist()
+    x1, y1, z1 = bbox_max.tolist()
+    return np.array(
+        [
+            [x0, y0, z0], [x0, y0, z1], [x0, y1, z0], [x0, y1, z1],
+            [x1, y0, z0], [x1, y0, z1], [x1, y1, z0], [x1, y1, z1],
+        ],
+        dtype=np.float32,
+    )
 
 
 def create_scene_box_object(
@@ -1079,23 +1102,8 @@ def create_scene_box_object(
     color=(1.0, 0.2, 0.2),
     emission_strength: float = 1.5,
 ):
-    """
-    创建一个渲染用的 canonical scene box（wireframe cube）。
-    注意：它只是可视化，不参与 mesh 导出。
-    """
-    bbox_min = np.asarray(bbox_min, dtype=np.float32)
-    bbox_max = np.asarray(bbox_max, dtype=np.float32)
-
-    corners = get_bbox_corners(bbox_min, bbox_max)
-
-    faces = [
-        [0, 1, 3, 2],
-        [4, 6, 7, 5],
-        [0, 4, 5, 1],
-        [2, 3, 7, 6],
-        [0, 2, 6, 4],
-        [1, 5, 7, 3],
-    ]
+    corners = get_bbox_corners(np.asarray(bbox_min, dtype=np.float32), np.asarray(bbox_max, dtype=np.float32))
+    faces = [[0, 1, 3, 2], [4, 6, 7, 5], [0, 4, 5, 1], [2, 3, 7, 6], [0, 2, 6, 4], [1, 5, 7, 3]]
 
     mesh = bpy.data.meshes.new(name + "Mesh")
     mesh.from_pydata(corners.tolist(), [], faces)
@@ -1113,11 +1121,7 @@ def create_scene_box_object(
         wire_mod.use_relative_offset = False
 
     rgba = (float(color[0]), float(color[1]), float(color[2]), 1.0)
-    mat = create_emission_material(
-        name=name + "Mat",
-        color=rgba,
-        strength=float(emission_strength),
-    )
+    mat = create_emission_material(name=name + "Mat", color=rgba, strength=float(emission_strength))
     if len(obj.data.materials) == 0:
         obj.data.materials.append(mat)
     else:
@@ -1129,12 +1133,7 @@ def create_scene_box_object(
 
 
 def cleanup_temp_render_file(base_path_no_ext: str):
-    candidates = [
-        base_path_no_ext,
-        base_path_no_ext + ".png",
-        base_path_no_ext + ".PNG",
-    ]
-    for p in candidates:
+    for p in (base_path_no_ext, base_path_no_ext + ".png", base_path_no_ext + ".PNG"):
         try:
             if os.path.isfile(p):
                 os.remove(p)
@@ -1149,15 +1148,6 @@ def render_rgb_and_normal(
     render_scene_box: bool = False,
     scene_box_affect_normal: bool = False,
 ):
-    """
-    默认行为：
-      - 不开 scene box: 一次 render，同时得到 rgb + normal
-      - 开 scene box 且不想污染 normal:
-            第一次：scene box 可见，只写 rgb
-            第二次：scene box 隐藏，只写 normal（会产生一个临时 rgb，再删掉）
-      - 开 scene box 且允许进入 normal:
-            一次 render，同时得到 rgb + normal
-    """
     if (scene_box_obj is None) or (not render_scene_box):
         if scene_box_obj is not None:
             scene_box_obj.hide_render = True
@@ -1178,38 +1168,17 @@ def render_rgb_and_normal(
 
     scene_box_obj.hide_render = True
     normal_output_node.mute = prev_mute
-
     tmp_rgb_base = os.path.splitext(rgb_path)[0] + "__normal_only__"
     render_frame(tmp_rgb_base)
     cleanup_temp_render_file(tmp_rgb_base)
 
 
-# =================================================================================
-#  5. STATIC MULTI-VIEW CAMERAS (CAMERA-SPACE TIGHT FIT)
-# =================================================================================
-
-def get_bbox_corners(bbox_min: np.ndarray, bbox_max: np.ndarray):
-    x0, y0, z0 = bbox_min.tolist()
-    x1, y1, z1 = bbox_max.tolist()
-    corners = np.array([
-        [x0, y0, z0],
-        [x0, y0, z1],
-        [x0, y1, z0],
-        [x0, y1, z1],
-        [x1, y0, z0],
-        [x1, y0, z1],
-        [x1, y1, z0],
-        [x1, y1, z1],
-    ], dtype=np.float32)
-    return corners
+# =====================================================================================
+# 5. CAMERA FITTING
+# =====================================================================================
 
 
 def compute_camera_axes_from_angles(azim: float, elev: float):
-    """
-    给定 orbit azim/elev，返回相机坐标系在 world 中的:
-      right, up, forward
-    其中 forward 是“相机看向 target”的方向。
-    """
     cam_pos_unit = orbit_offset(1.0, azim, elev)
     forward = normalize(-cam_pos_unit)
     world_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
@@ -1224,53 +1193,36 @@ def compute_camera_axes_from_angles(azim: float, elev: float):
 
 
 def compute_world_to_camera_aligned_rotation(azim: float, elev: float):
-    """
-    返回一个 3x3 矩阵 R，使得:
-        p_cam_aligned = R @ p_world
-    其中 p_cam_aligned 的三个坐标轴分别是:
-        x = right
-        y = up
-        z = forward
-    """
     right, up, forward = compute_camera_axes_from_angles(azim, elev)
     R = np.stack([right, up, forward], axis=0).astype(np.float32)
     return R, right, up, forward
 
 
-def camera_aligned_bbox_corners_to_world(
-    bbox_min_cam: np.ndarray,
-    bbox_max_cam: np.ndarray,
-    azim: float,
-    elev: float,
-):
-    """
-    把 camera-aligned bbox 的 8 个角点映射回 world，用于 debug 投影。
-    """
-    corners_cam = get_bbox_corners(
-        np.asarray(bbox_min_cam, dtype=np.float32),
-        np.asarray(bbox_max_cam, dtype=np.float32),
-    )
+def camera_aligned_bbox_corners_to_world(bbox_min_cam: np.ndarray, bbox_max_cam: np.ndarray, azim: float, elev: float):
+    corners_cam = get_bbox_corners(np.asarray(bbox_min_cam, dtype=np.float32), np.asarray(bbox_max_cam, dtype=np.float32))
     right, up, forward = compute_camera_axes_from_angles(azim, elev)
     basis_cols = np.stack([right, up, forward], axis=1).astype(np.float32)
     corners_world = corners_cam @ basis_cols.T
     return corners_world.astype(np.float32)
 
 
-def compute_camera_space_scene_box_from_vertices_seq(
-    vertices_seq_list: List[np.ndarray],
-    rot_world_to_cam_aligned: np.ndarray,
-):
-    """
-    对整个 normalized 序列，旋转到当前 view 的 camera-aligned space，
-    并聚合出序列级别的 scene box。
-    """
+def debug_project_camera_space_bbox(cam_obj, bbox_min_cam, bbox_max_cam, azim: float, elev: float):
+    corners_world = camera_aligned_bbox_corners_to_world(
+        np.asarray(bbox_min_cam, dtype=np.float32),
+        np.asarray(bbox_max_cam, dtype=np.float32),
+        azim=azim,
+        elev=elev,
+    )
+    debug_project_world_points(cam_obj, corners_world, title="camera-space sequence bbox mapped to world")
+
+
+def compute_camera_space_scene_box_from_vertices_seq(vertices_seq: np.ndarray, rot_world_to_cam_aligned: np.ndarray):
     global_min = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
     global_max = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float32)
-
     rot_t = rot_world_to_cam_aligned.T.astype(np.float32)
 
-    for verts in vertices_seq_list:
-        verts32 = np.asarray(verts, dtype=np.float32)
+    for f in range(vertices_seq.shape[0]):
+        verts32 = np.asarray(vertices_seq[f], dtype=np.float32)
         verts_cam = verts32 @ rot_t
         global_min = np.minimum(global_min, verts_cam.min(axis=0))
         global_max = np.maximum(global_max, verts_cam.max(axis=0))
@@ -1279,54 +1231,32 @@ def compute_camera_space_scene_box_from_vertices_seq(
 
 
 def compute_bbox_unit_normalization_scale(bbox_min: np.ndarray, bbox_max: np.ndarray):
-    """
-    对 axis-aligned bbox 求一个 uniform scale，使其最大边长归一化到 1。
-    """
     extent = np.asarray(bbox_max, dtype=np.float32) - np.asarray(bbox_min, dtype=np.float32)
     max_extent = float(np.max(extent))
     scale = 1.0 / max_extent if max_extent > 1e-6 else 1.0
     return float(scale), extent.astype(np.float32)
 
 
-def compute_tight_camera_distance_for_aligned_bbox(
-    cam_obj,
-    bbox_min_aligned: np.ndarray,
-    bbox_max_aligned: np.ndarray,
-    frame_padding: float = 0.03,
-    fit_safety: float = 1.02,
-):
-    """
-    对“已经处于 camera-aligned space 的 bbox”求 tight camera distance。
-    这里不再需要 azim/elev，因为 bbox 已经被旋到了该 camera 的坐标系下。
-
-    假设 camera 位于 +distance * cam_pos_unit 方向，物体中心仍在 world 原点。
-    对应到 aligned 坐标中，每个点 p=(x,y,z)，相机看到的深度是 (distance - z)。
-    """
-    bbox_min_aligned = np.asarray(bbox_min_aligned, dtype=np.float32)
-    bbox_max_aligned = np.asarray(bbox_max_aligned, dtype=np.float32)
-    corners = get_bbox_corners(bbox_min_aligned, bbox_max_aligned)
+def compute_tight_camera_distance_for_aligned_bbox(cam_obj, bbox_min_aligned: np.ndarray, bbox_max_aligned: np.ndarray, frame_padding: float = 0.03, fit_safety: float = 1.02):
+    corners = get_bbox_corners(np.asarray(bbox_min_aligned, dtype=np.float32), np.asarray(bbox_max_aligned, dtype=np.float32))
 
     half_fov_x = 0.5 * float(cam_obj.data.angle_x)
     half_fov_y = 0.5 * float(cam_obj.data.angle_y)
-
     tan_half_fov_x = max(math.tan(half_fov_x), 1e-6)
     tan_half_fov_y = max(math.tan(half_fov_y), 1e-6)
 
     fill_ratio = max(1e-3, 1.0 - float(frame_padding))
     d_required = 0.0
-
     for p in corners:
         px = abs(float(p[0]))
         py = abs(float(p[1]))
         pz = float(p[2])
-
         req_x = px / (fill_ratio * tan_half_fov_x) - pz
         req_y = py / (fill_ratio * tan_half_fov_y) - pz
         d_required = max(d_required, req_x, req_y)
 
     min_pz = float(np.min(corners[:, 2]))
     d_required = max(d_required, -min_pz + 1e-4)
-
     d_required = max(d_required * float(fit_safety), 1e-4)
     return float(d_required)
 
@@ -1334,7 +1264,7 @@ def compute_tight_camera_distance_for_aligned_bbox(
 def create_static_multiview_cameras(
     num_cameras: int,
     seed: int,
-    normalized_vertices_seq: List[np.ndarray],
+    normalized_vertices_seq: np.ndarray,
     resolution: int,
     elev_min_deg: float = 0.0,
     elev_max_deg: float = 80.0,
@@ -1346,25 +1276,8 @@ def create_static_multiview_cameras(
     camera_fov_max_deg: float = 70.0,
     camera_sensor_size: float = 36.0,
 ):
-    """
-    固定多视角相机：
-      - 第 0 个 azimuth 随机
-      - 后续 azimuth 均匀分布
-      - 每个 camera 的 elevation ~ U([elev_min_deg, elev_max_deg])
-      - 每个 camera 的 distance:
-            1) 把整个 normalized sequence 旋转到 camera-aligned space
-            2) 聚合出 scene_box_camera_space
-            3) 基于该 box 再做一个 view-specific normalization
-            4) 在该 normalized camera-space box 上求 tight distance
-            5) 再把 distance 映射回共享 world-normalized scene
-      - 全部看向原点 (0,0,0)
-
-    额外支持：
-      - 每个 camera 随机一个共同 FOV，保持 fovx = fovy
-    """
     rng = np.random.default_rng(seed)
     distance_jitter_scale = max(1.0, float(distance_jitter_scale))
-
     if camera_fov_min_deg > camera_fov_max_deg:
         raise ValueError("camera_fov_min_deg must be <= camera_fov_max_deg")
 
@@ -1386,11 +1299,7 @@ def create_static_multiview_cameras(
 
         if randomize_camera_intrinsics:
             sampled_fov_deg = float(rng.uniform(camera_fov_min_deg, camera_fov_max_deg))
-            set_camera_intrinsics_from_fov(
-                cam_obj,
-                fov_deg=sampled_fov_deg,
-                sensor_size=float(camera_sensor_size),
-            )
+            set_camera_intrinsics_from_fov(cam_obj, fov_deg=sampled_fov_deg, sensor_size=float(camera_sensor_size))
         else:
             sampled_fov_deg = float(math.degrees(cam_obj.data.angle_x))
             cam_obj.data.sensor_fit = "HORIZONTAL"
@@ -1401,21 +1310,13 @@ def create_static_multiview_cameras(
         elev_deg = float(elevs_deg[k])
         elev = math.radians(elev_deg)
 
-        rot_world_to_cam_aligned, right, up, forward = compute_world_to_camera_aligned_rotation(
-            azim=azim,
-            elev=elev,
-        )
-
+        rot_world_to_cam_aligned, right, up, forward = compute_world_to_camera_aligned_rotation(azim=azim, elev=elev)
         camera_space_bbox_min, camera_space_bbox_max = compute_camera_space_scene_box_from_vertices_seq(
             normalized_vertices_seq,
             rot_world_to_cam_aligned=rot_world_to_cam_aligned,
         )
 
-        view_specific_scale, camera_space_extent = compute_bbox_unit_normalization_scale(
-            camera_space_bbox_min,
-            camera_space_bbox_max,
-        )
-
+        view_specific_scale, camera_space_extent = compute_bbox_unit_normalization_scale(camera_space_bbox_min, camera_space_bbox_max)
         normalized_camera_space_bbox_min = (camera_space_bbox_min * view_specific_scale).astype(np.float32)
         normalized_camera_space_bbox_max = (camera_space_bbox_max * view_specific_scale).astype(np.float32)
 
@@ -1427,69 +1328,96 @@ def create_static_multiview_cameras(
             fit_safety=fit_safety,
         )
 
-        tight_distance = float(
-            tight_distance_in_view_normalized_space / max(view_specific_scale, 1e-8)
-        )
-
+        tight_distance = float(tight_distance_in_view_normalized_space / max(view_specific_scale, 1e-8))
         distance = tight_distance * float(rng.uniform(1.0, distance_jitter_scale))
-
         cam_pos = orbit_offset(distance, azim, elev)
         cam2world = look_at(cam_pos, target)
         set_camera_from_cam2world(cam_obj, cam2world)
-
         intrinsics = get_camera_intrinsics_dict(cam_obj, resolution=resolution)
 
-        camera_info = {
-            "camera_name": cam_obj.name,
-            "view_index": int(k),
-            "azimuth_deg": float(np.degrees(azim)),
-            "elevation_deg": float(elev_deg),
-
-            "camera_space_scene_box_min": camera_space_bbox_min.astype(np.float32).tolist(),
-            "camera_space_scene_box_max": camera_space_bbox_max.astype(np.float32).tolist(),
-            "camera_space_scene_box_extent": camera_space_extent.astype(np.float32).tolist(),
-
-            "camera_space_sequence_scale_for_unit_box": float(view_specific_scale),
-            "normalized_camera_space_scene_box_min": normalized_camera_space_bbox_min.tolist(),
-            "normalized_camera_space_scene_box_max": normalized_camera_space_bbox_max.tolist(),
-
-            "tight_fit_distance_in_view_normalized_space": float(tight_distance_in_view_normalized_space),
-            "tight_fit_distance": float(tight_distance),
-            "distance": float(distance),
-            "distance_scale_from_tight_fit": float(distance / max(tight_distance, 1e-8)),
-
-            "world_to_camera_aligned_rotation": rot_world_to_cam_aligned.astype(np.float32).tolist(),
-            "camera_right_world": right.astype(np.float32).tolist(),
-            "camera_up_world": up.astype(np.float32).tolist(),
-            "camera_forward_world": forward.astype(np.float32).tolist(),
-
-            "camera_c2w": cam2world.astype(np.float32).tolist(),
-            "camera_pos": cam_pos.astype(np.float32).tolist(),
-            "camera_target": target.astype(np.float32).tolist(),
-
-            "sampled_common_fov_deg": float(sampled_fov_deg),
-            "intrinsics": intrinsics,
-
-            "distance_estimation_method": (
-                "rotate_normalized_sequence_to_camera_space -> "
-                "aggregate_sequence_bbox_in_camera_space -> "
-                "view_specific_bbox_normalization -> "
-                "tight_distance_on_normalized_camera_space_bbox"
-            ),
-        }
-
+        camera_infos.append(
+            {
+                "camera_name": cam_obj.name,
+                "view_index": int(k),
+                "azimuth_deg": float(np.degrees(azim)),
+                "elevation_deg": float(elev_deg),
+                "camera_space_scene_box_min": camera_space_bbox_min.tolist(),
+                "camera_space_scene_box_max": camera_space_bbox_max.tolist(),
+                "camera_space_scene_box_extent": camera_space_extent.tolist(),
+                "camera_space_sequence_scale_for_unit_box": float(view_specific_scale),
+                "normalized_camera_space_scene_box_min": normalized_camera_space_bbox_min.tolist(),
+                "normalized_camera_space_scene_box_max": normalized_camera_space_bbox_max.tolist(),
+                "tight_fit_distance_in_view_normalized_space": float(tight_distance_in_view_normalized_space),
+                "tight_fit_distance": float(tight_distance),
+                "distance": float(distance),
+                "distance_scale_from_tight_fit": float(distance / max(tight_distance, 1e-8)),
+                "world_to_camera_aligned_rotation": rot_world_to_cam_aligned.tolist(),
+                "camera_right_world": right.tolist(),
+                "camera_up_world": up.tolist(),
+                "camera_forward_world": forward.tolist(),
+                "camera_c2w": cam2world.tolist(),
+                "camera_pos": cam_pos.tolist(),
+                "camera_target": target.tolist(),
+                "sampled_common_fov_deg": float(sampled_fov_deg),
+                "intrinsics": intrinsics,
+                "distance_estimation_method": (
+                    "rotate_normalized_sequence_to_camera_space -> "
+                    "aggregate_sequence_bbox_in_camera_space -> "
+                    "view_specific_bbox_normalization -> "
+                    "tight_distance_on_normalized_camera_space_bbox"
+                ),
+            }
+        )
         camera_objs.append(cam_obj)
-        camera_infos.append(camera_info)
 
     return camera_objs, camera_infos
 
+def is_view_done(rgb_path: str, normal_path: str) -> bool:
+    return os.path.isfile(rgb_path) and os.path.isfile(normal_path)
 
-# =================================================================================
-#  6. CORE WORKER
-# =================================================================================
+def get_view_meta_path(meta_root: str, view_idx: int, frame_int: int) -> str:
+    return os.path.join(meta_root, f"view_{view_idx:02d}", f"frame_{frame_int:04d}.json")
+
+def atomic_write_json(path: str, data: dict):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, path)
+
+def to_skip_40075(output_file_there):
+    """
+    output_file like this
+    vis/rendering_v5/000-033_static_camera_distance_v3/5dd2ce713485413a84bceacf15e40b9f_traj_$traj_id/result.json
+    """
+    root = Path("/group/40034/yanruibin/projects/4D_video_data_process/data/objverse_minghao_4d_mine_40075/rendering_v5")
+    output_file_there = Path(output_file_there)
+    output_file = root / output_file_there.parents[1] / output_file_there.parents[0] / output_file_there.name
+    
+    output_file = str(output_file)
+    mesh_npz_path = os.path.splitext(output_file)[0] + "_mesh.npz"
+
+    json_exists = os.path.exists(output_file)
+    mesh_npz_exists = os.path.exists(mesh_npz_path)
+
+    if json_exists and mesh_npz_exists:
+        print(
+            f"✅ Skipped (requested outputs already exist): "
+            f"json={output_file}, "
+            f"mesh_npz={mesh_npz_path}"
+        )
+        return True
+    else:
+        return False
+
+# =====================================================================================
+# 6. CORE WORKER
+# =====================================================================================
+
 
 def process_geometry(args):
-    print("--- Starting Geometry Processing ---")
+    timer = StageTimer()
+    print("--- Starting Geometry Processing (optimized) ---")
 
     output_file = args.output_file
     normalized_glb_path = args.normalized_glb_path.strip()
@@ -1498,12 +1426,16 @@ def process_geometry(args):
     normal_dir = os.path.splitext(output_file)[0] + "_normal"
     mesh_npz_path = os.path.splitext(output_file)[0] + "_mesh.npz"
     mesh_ply_dir = os.path.splitext(output_file)[0] + "_mesh_ply"
+    meta_dir = os.path.splitext(output_file)[0] + "_meta"
 
     json_exists = os.path.exists(output_file)
     glb_exists = (normalized_glb_path == "") or os.path.exists(normalized_glb_path)
     mesh_npz_exists = os.path.exists(mesh_npz_path)
     ply_dir_exists = (not args.export_keyframe_ply) or os.path.isdir(mesh_ply_dir)
 
+    if to_skip_40075(output_file):
+        return
+        
     if (not args.render_scene_box) and json_exists and glb_exists and mesh_npz_exists and ply_dir_exists:
         print(
             f"✅ Skipped (requested outputs already exist): "
@@ -1516,25 +1448,35 @@ def process_geometry(args):
     os.makedirs(normal_dir, exist_ok=True)
     if args.export_keyframe_ply:
         os.makedirs(mesh_ply_dir, exist_ok=True)
+    os.makedirs(meta_dir, exist_ok=True)
 
     print(f"Loading object from: {args.object_path}")
     init_scene()
     load_object(args.object_path)
+    timer.log("scene init + load object")
 
     sequence_normalizer = create_sequence_normalizer()
     print("Sequence normalizer created.")
+    timer.log("create sequence normalizer")
 
-    # render
     if args.render_engine == "CYCLES":
-        enable_cycles_acceleration(args.cycles_backend)
+        if args.render_engine == "CYCLES":
+            enable_cycles_device(
+                device=args.cycles_device,
+                backend=args.cycles_backend,
+            )
 
     setup_renderer(
         resolution=args.resolution,
         engine=args.render_engine,
         transparent_bg=args.transparent_bg,
+        cycles_samples=args.cycles_samples,
+        cycles_use_denoising=args.cycles_use_denoising,
+        cycles_use_adaptive_sampling=(not args.disable_adaptive_sampling),
+        cycles_device=args.cycles_device,
     )
-
     normal_output_node = setup_normal_output(normal_dir)
+    timer.log("renderer + normal output setup")
 
     mesh_objs = []
     for obj in bpy.context.scene.objects:
@@ -1552,22 +1494,86 @@ def process_geometry(args):
     print("Found mesh objects:")
     for obj in mesh_objs:
         print(
-            f"  name={obj.name}, "
-            f"type={obj.type}, "
-            f"hide_render={obj.hide_render}, "
-            f"hide_viewport={obj.hide_viewport}, "
-            f"visible_get={obj.visible_get(view_layer=bpy.context.view_layer)}"
+            f"  name={obj.name}, type={obj.type}, hide_render={obj.hide_render}, "
+            f"hide_viewport={obj.hide_viewport}, visible_get={obj.visible_get(view_layer=bpy.context.view_layer)}"
         )
 
+    # -------------------------------------------------------------------------
+    # Resolve raw animation frame range from actions / scene
+    # -------------------------------------------------------------------------
     actions = bpy.data.actions
-    frame_start, frame_end = (bpy.context.scene.frame_start, bpy.context.scene.frame_end)
+    raw_frame_start, raw_frame_end = (bpy.context.scene.frame_start, bpy.context.scene.frame_end)
     if actions:
         ranges = [action.frame_range for action in actions]
-        frame_start = int(min(r[0] for r in ranges))
-        frame_end = int(max(r[1] for r in ranges))
-        # frame_end = frame_start + 10
+        raw_frame_start = int(min(r[0] for r in ranges))
+        raw_frame_end = int(max(r[1] for r in ranges))
 
-    frame_indices = np.arange(frame_start, frame_end + 1, dtype=np.int32)
+    raw_frame_indices = np.arange(raw_frame_start, raw_frame_end + 1, dtype=np.int32)
+
+    # -------------------------------------------------------------------------
+    # Motion trimming using umeyama_similarity.json
+    # -------------------------------------------------------------------------
+    umeyama_json_path = resolve_umeyama_json_path(args.object_path, args.motion_info_root)
+
+    motion_trim_summary = {
+        "enabled": True,
+        "umeyama_json_found": False,
+        "umeyama_json_path": str(umeyama_json_path),
+        "motion_rms_threshold": float(args.motion_rms_threshold),
+        "trim_reason": "umeyama_json_not_found_keep_all",
+        "keep_start_frame": int(raw_frame_indices[0]),
+        "keep_end_frame": int(raw_frame_indices[-1]),
+        "num_frames_before_trim": int(len(raw_frame_indices)),
+        "num_frames_after_trim": int(len(raw_frame_indices)),
+        "num_head_frames_removed": 0,
+        "num_tail_frames_removed": 0,
+        "missing_frames_count": 0,
+        "missing_frames_example": [],
+        "per_frame_rms_lookup": {},
+        "per_frame_has_motion_lookup": {},
+    }
+
+
+    if umeyama_json_path.is_file():
+        frame_to_rms, raw_frame_indices = load_frame_rms_from_umeyama(str(umeyama_json_path))
+        motion_trim_summary = compute_trimmed_frame_range_from_umeyama(
+            raw_frame_indices,
+            frame_to_rms,
+            rms_threshold=args.motion_rms_threshold,
+        )
+        motion_trim_summary["enabled"] = True
+        motion_trim_summary["umeyama_json_found"] = True
+        motion_trim_summary["umeyama_json_path"] = str(umeyama_json_path)
+        motion_trim_summary["motion_rms_threshold"] = float(args.motion_rms_threshold)
+
+        frame_indices = motion_trim_summary["trimmed_frame_indices"]
+
+        print("Umeyama motion trim summary:")
+        print(f"  json_path = {umeyama_json_path}")
+        print(f"  rms_threshold = {args.motion_rms_threshold}")
+        print(f"  before_trim = {motion_trim_summary['num_frames_before_trim']}")
+        print(f"  after_trim  = {motion_trim_summary['num_frames_after_trim']}")
+        print(f"  removed_head = {motion_trim_summary['num_head_frames_removed']}")
+        print(f"  removed_tail = {motion_trim_summary['num_tail_frames_removed']}")
+        print(f"  keep_range = [{motion_trim_summary['keep_start_frame']}, {motion_trim_summary['keep_end_frame']}]")
+        print(f"  missing_frames_count = {motion_trim_summary['missing_frames_count']}")
+    else:
+        print(f"Warning: umeyama_similarity.json not found, skip motion trim: {umeyama_json_path}")
+
+    # Keep original random crop behavior if still too long after motion trim
+    if len(frame_indices) > 121:
+        crop_start_local = int(np.random.randint(0, len(frame_indices) - 121 + 1))
+        frame_indices = frame_indices[crop_start_local : crop_start_local + 121]
+        print(
+            f"Frame range still too long after motion trim; "
+            f"randomly crop to 121 frames: [{int(frame_indices[0])}, {int(frame_indices[-1])}]"
+        )
+
+    frame_start = int(frame_indices[0])
+    frame_end = int(frame_indices[-1])
+
+    per_frame_rms_lookup = motion_trim_summary["per_frame_rms_lookup"]
+    per_frame_has_motion_lookup = motion_trim_summary["per_frame_has_motion_lookup"]
 
     keyframe_frames = collect_keyframe_frames(frame_start, frame_end)
     if len(keyframe_frames) == 0:
@@ -1576,32 +1582,43 @@ def process_geometry(args):
         print(f"Detected {len(keyframe_frames)} keyframes: {keyframe_frames}")
     keyframe_frame_set = set(keyframe_frames)
 
-    shared_faces, centers_seq, sequence_scale, canonical_bbox_min, canonical_bbox_max = \
-        compute_sequence_normalization_params(mesh_objs, frame_indices)
+    (
+        shared_faces,
+        centers_seq,
+        sequence_scale,
+        canonical_bbox_min,
+        canonical_bbox_max,
+        raw_vertices_cache,
+    ) = compute_sequence_normalization_params_and_cache(
+        mesh_objs,
+        frame_indices,
+        cache_raw_vertices=True,
+        raw_cache_dtype=np.float16,
+    )
+    timer.log("first pass: topology + normalization params + raw cache")
 
     print("Sequence normalization:")
     print(f"  sequence_scale = {sequence_scale}")
     print(f"  canonical_bbox_min = {canonical_bbox_min.tolist()}")
     print(f"  canonical_bbox_max = {canonical_bbox_max.tolist()}")
 
-    print("Precomputing normalized mesh sequence for camera fitting / mesh export...")
-    vertices_seq_list, keyframe_ply_records = precompute_normalized_mesh_sequence(
-        mesh_objs=mesh_objs,
-        frame_indices=frame_indices,
-        normalizer_obj=sequence_normalizer,
+    vertices_seq, keyframe_ply_records = precompute_normalized_mesh_sequence_from_cache(
+        raw_vertices_cache=raw_vertices_cache,
         centers_seq=centers_seq,
         global_scale=sequence_scale,
         shared_faces=shared_faces,
+        frame_indices=frame_indices,
         export_keyframe_ply=args.export_keyframe_ply,
         keyframe_frame_set=keyframe_frame_set,
         mesh_ply_dir=mesh_ply_dir,
     )
+    timer.log("normalize cached mesh sequence + optional keyframe ply")
 
     camera_seed = int(args.traj_seed + args.traj_id * 9973)
     camera_objs, camera_infos = create_static_multiview_cameras(
         num_cameras=args.num_cameras,
         seed=camera_seed,
-        normalized_vertices_seq=vertices_seq_list,
+        normalized_vertices_seq=vertices_seq,
         resolution=args.resolution,
         elev_min_deg=args.camera_elev_min_deg,
         elev_max_deg=args.camera_elev_max_deg,
@@ -1613,15 +1630,10 @@ def process_geometry(args):
         camera_fov_max_deg=args.camera_fov_max_deg,
         camera_sensor_size=args.camera_sensor_size,
     )
+    timer.log("create static cameras")
 
     lighting_seed = resolve_lighting_seed(args)
     hdr_strength_min, hdr_strength_max = resolve_hdr_strength_range(args)
-
-    lighting_controller = create_per_camera_lighting_controller(
-        scene=bpy.context.scene,
-        sunlight_energy=args.sunlight_energy,
-    )
-
     per_camera_lighting = sample_per_camera_lighting_configs(
         num_cameras=args.num_cameras,
         seed=lighting_seed,
@@ -1631,34 +1643,33 @@ def process_geometry(args):
         hdr_strength_min=hdr_strength_min,
         hdr_strength_max=hdr_strength_max,
     )
-
+    lighting_controller = create_per_camera_lighting_controller(
+        scene=bpy.context.scene,
+        sunlight_energy=args.sunlight_energy,
+        per_camera_lighting=per_camera_lighting,
+    )
     for view_idx in range(args.num_cameras):
         camera_infos[view_idx]["lighting"] = per_camera_lighting[view_idx]
-
     bpy.context.scene.camera = camera_objs[0]
+    timer.log("lighting configs + reusable HDR setup")
 
     print("Static multi-view camera setup:")
     for info in camera_infos:
         intr = info["intrinsics"]
         lighting = info["lighting"]
         print(
-            f"  view {info['view_index']:02d}: "
-            f"azim={info['azimuth_deg']:.2f} deg, "
-            f"elev={info['elevation_deg']:.2f} deg, "
-            f"tight_dist={info['tight_fit_distance']:.4f}, "
-            f"dist={info['distance']:.4f}, "
-            f"view_scale={info['camera_space_sequence_scale_for_unit_box']:.4f}, "
-            f"fovx={intr['fov_x_deg']:.2f}, "
-            f"fovy={intr['fov_y_deg']:.2f}, "
-            f"fx={intr['fx_px']:.2f}, "
-            f"fy={intr['fy_px']:.2f}, "
-            f"lighting={lighting['lighting_type']}, "
-            f"hdr_strength={lighting['hdr_strength']}"
+            f"  view {info['view_index']:02d}: azim={info['azimuth_deg']:.2f} deg, "
+            f"elev={info['elevation_deg']:.2f} deg, tight_dist={info['tight_fit_distance']:.4f}, "
+            f"dist={info['distance']:.4f}, view_scale={info['camera_space_sequence_scale_for_unit_box']:.4f}, "
+            f"fovx={intr['fov_x_deg']:.2f}, fovy={intr['fov_y_deg']:.2f}, "
+            f"fx={intr['fx_px']:.2f}, fy={intr['fy_px']:.2f}, "
+            f"lighting={lighting['lighting_type']}, hdr_strength={lighting['hdr_strength']}"
         )
 
     for view_idx in range(args.num_cameras):
         os.makedirs(os.path.join(rgb_dir, f"view_{view_idx:02d}"), exist_ok=True)
         os.makedirs(os.path.join(normal_dir, f"view_{view_idx:02d}"), exist_ok=True)
+        os.makedirs(os.path.join(meta_dir, f"view_{view_idx:02d}"), exist_ok=True)
 
     if normalized_glb_path:
         print("Baking sequence normalization to keyframes for GLB export...")
@@ -1668,10 +1679,10 @@ def process_geometry(args):
             centers_seq=centers_seq,
             global_scale=sequence_scale,
         )
-
         bpy.context.scene.frame_set(int(frame_indices[0]))
         bpy.context.view_layer.update()
         export_normalized_scene_as_glb(normalized_glb_path)
+        timer.log("optional normalized glb export")
 
     scene_box_obj = None
     if args.render_scene_box:
@@ -1688,18 +1699,24 @@ def process_geometry(args):
         print(f"  scene_box_color = {args.scene_box_color}")
         print(f"  scene_box_emission_strength = {args.scene_box_emission_strength}")
         print(f"  scene_box_affect_normal = {args.scene_box_affect_normal}")
-        print("  note: rendered scene box is still the shared world-canonical box.")
 
     final_watertight_data = {}
     from tqdm import tqdm
 
+    render_stage_t0 = time.perf_counter()
     for local_frame_idx, source_frame in enumerate(tqdm(frame_indices, desc="Rendering frames")):
         frame_int = int(source_frame)
         frame_key = f"frame_{frame_int:04d}"
         print(f"Processing {frame_key} ({local_frame_idx + 1}/{len(frame_indices)})")
 
-        bpy.context.scene.frame_set(frame_int)
+        last_view_idx = args.num_cameras - 1
+        last_view_meta_path = get_view_meta_path(meta_dir, last_view_idx, frame_int)
 
+        if os.path.isfile(last_view_meta_path):
+            print(f"Skip whole frame because last camera meta exists: {last_view_meta_path}")
+            continue
+
+        bpy.context.scene.frame_set(frame_int)
         apply_sequence_normalization(
             sequence_normalizer,
             frame_center=centers_seq[local_frame_idx],
@@ -1713,10 +1730,13 @@ def process_geometry(args):
             mesh_ply_path = keyframe_ply_records.get(frame_int, None)
 
         views = []
-
         for view_idx, (camera_obj, camera_info) in enumerate(zip(camera_objs, camera_infos)):
-            bpy.context.scene.camera = camera_obj
+            view_meta_path = get_view_meta_path(meta_dir, view_idx, frame_int)
+            if os.path.isfile(view_meta_path):
+                print(f"Skip camera because meta exists: frame={frame_int}, view={view_idx}")
+                continue
 
+            bpy.context.scene.camera = camera_obj
             lighting_config = per_camera_lighting[view_idx]
             apply_per_camera_lighting(
                 scene=bpy.context.scene,
@@ -1735,15 +1755,8 @@ def process_geometry(args):
 
             view_rgb_dir = os.path.join(rgb_dir, f"view_{view_idx:02d}")
             view_normal_dir = os.path.join(normal_dir, f"view_{view_idx:02d}")
-
             rgb_path = os.path.join(view_rgb_dir, f"frame_{frame_int:04d}.png")
-
-            normal_prefix = "frame_"
-            update_normal_output_path(
-                normal_output_node,
-                base_dir=view_normal_dir,
-                prefix=normal_prefix,
-            )
+            update_normal_output_path(normal_output_node, base_dir=view_normal_dir, prefix="frame_")
             normal_path = os.path.join(view_normal_dir, f"frame_{frame_int:04d}.png")
 
             render_rgb_and_normal(
@@ -1754,7 +1767,10 @@ def process_geometry(args):
                 scene_box_affect_normal=args.scene_box_affect_normal,
             )
 
-            views.append({
+            camera_meta = {
+                "frame_index": frame_int,
+                "mesh_npz_path": mesh_npz_path,
+                "mesh_frame_index": int(local_frame_idx),
                 "view_index": int(view_idx),
                 "rgb_path": rgb_path,
                 "normal_path": normal_path,
@@ -1763,50 +1779,93 @@ def process_geometry(args):
                 "camera_target": camera_info["camera_target"],
                 "azimuth_deg": camera_info["azimuth_deg"],
                 "elevation_deg": camera_info["elevation_deg"],
-
                 "camera_space_scene_box_min": camera_info["camera_space_scene_box_min"],
                 "camera_space_scene_box_max": camera_info["camera_space_scene_box_max"],
                 "camera_space_sequence_scale_for_unit_box": camera_info["camera_space_sequence_scale_for_unit_box"],
                 "normalized_camera_space_scene_box_min": camera_info["normalized_camera_space_scene_box_min"],
                 "normalized_camera_space_scene_box_max": camera_info["normalized_camera_space_scene_box_max"],
-
                 "tight_fit_distance_in_view_normalized_space": camera_info["tight_fit_distance_in_view_normalized_space"],
                 "tight_fit_distance": camera_info["tight_fit_distance"],
                 "distance": camera_info["distance"],
                 "distance_scale_from_tight_fit": camera_info["distance_scale_from_tight_fit"],
-
                 "sampled_common_fov_deg": camera_info["sampled_common_fov_deg"],
                 "intrinsics": camera_info["intrinsics"],
                 "distance_estimation_method": camera_info["distance_estimation_method"],
-
                 "lighting": lighting_config,
-            })
+                "frame_bbox_center_before_normalization": centers_seq[local_frame_idx].astype(np.float32).tolist(),
+                "canonical_bbox_center": [0.0, 0.0, 0.0],
+                "umeyama_rms_error": (
+                    None
+                    if per_frame_rms_lookup.get(frame_int, None) is None
+                    else float(per_frame_rms_lookup[frame_int])
+                ),
+                "has_motion_by_umeyama": per_frame_has_motion_lookup.get(frame_int, None),
+                "is_keyframe": bool(frame_int in keyframe_frame_set),
+                "mesh_ply_path": (
+                    keyframe_ply_records.get(frame_int, None)
+                    if args.export_keyframe_ply and (frame_int in keyframe_frame_set)
+                    else None
+                ),
+            }
 
-        final_watertight_data[frame_key] = {
-            "mesh_npz_path": mesh_npz_path,
-            "mesh_frame_index": int(local_frame_idx),
-            "frame_index": frame_int,
-            "is_keyframe": bool(is_keyframe),
-            "mesh_ply_path": mesh_ply_path,
-            "frame_bbox_center_before_normalization": centers_seq[local_frame_idx].astype(np.float32).tolist(),
-            "canonical_bbox_center": [0.0, 0.0, 0.0],
-            "views": views,
-        }
+            atomic_write_json(view_meta_path, camera_meta)
+            # views.append(
+            #     {
+            #         "view_index": int(view_idx),
+            #         "rgb_path": rgb_path,
+            #         "normal_path": normal_path,
+            #         "camera_c2w": camera_info["camera_c2w"],
+            #         "camera_pos": camera_info["camera_pos"],
+            #         "camera_target": camera_info["camera_target"],
+            #         "azimuth_deg": camera_info["azimuth_deg"],
+            #         "elevation_deg": camera_info["elevation_deg"],
+            #         "camera_space_scene_box_min": camera_info["camera_space_scene_box_min"],
+            #         "camera_space_scene_box_max": camera_info["camera_space_scene_box_max"],
+            #         "camera_space_sequence_scale_for_unit_box": camera_info["camera_space_sequence_scale_for_unit_box"],
+            #         "normalized_camera_space_scene_box_min": camera_info["normalized_camera_space_scene_box_min"],
+            #         "normalized_camera_space_scene_box_max": camera_info["normalized_camera_space_scene_box_max"],
+            #         "tight_fit_distance_in_view_normalized_space": camera_info["tight_fit_distance_in_view_normalized_space"],
+            #         "tight_fit_distance": camera_info["tight_fit_distance"],
+            #         "distance": camera_info["distance"],
+            #         "distance_scale_from_tight_fit": camera_info["distance_scale_from_tight_fit"],
+            #         "sampled_common_fov_deg": camera_info["sampled_common_fov_deg"],
+            #         "intrinsics": camera_info["intrinsics"],
+            #         "distance_estimation_method": camera_info["distance_estimation_method"],
+            #         "lighting": lighting_config,
+            #     }
+            # )
 
-    vertices_seq = np.stack(vertices_seq_list, axis=0)
+        # final_watertight_data[frame_key] = {
+        #     "mesh_npz_path": mesh_npz_path,
+        #     "mesh_frame_index": int(local_frame_idx),
+        #     "frame_index": frame_int,
+        #     "is_keyframe": bool(is_keyframe),
+        #     "mesh_ply_path": mesh_ply_path,
+        #     "frame_bbox_center_before_normalization": centers_seq[local_frame_idx].astype(np.float32).tolist(),
+        #     "canonical_bbox_center": [0.0, 0.0, 0.0],
+        #     "umeyama_rms_error": (
+        #         None
+        #         if per_frame_rms_lookup.get(frame_int, None) is None
+        #         else float(per_frame_rms_lookup[frame_int])
+        #     ),
+        #     "has_motion_by_umeyama": per_frame_has_motion_lookup.get(frame_int, None),
+        #     "views": views,
+        # }
+
+    print(f"[timing] rendering loop: {time.perf_counter() - render_stage_t0:.3f}s")
+    timer.log("render all frames")
 
     print(f"Saving mesh sequence to {mesh_npz_path} ...")
     os.makedirs(os.path.dirname(mesh_npz_path) or ".", exist_ok=True)
-    np.savez_compressed(
-        mesh_npz_path,
-        vertices=vertices_seq,
-        faces=shared_faces,
-        frame_indices=frame_indices,
-    )
+    if args.save_compressed_mesh:
+        np.savez_compressed(mesh_npz_path, vertices=vertices_seq, faces=shared_faces, frame_indices=frame_indices)
+    else:
+        np.savez(mesh_npz_path, vertices=vertices_seq, faces=shared_faces, frame_indices=frame_indices)
     print(
         f"Mesh npz saved. vertices.shape={vertices_seq.shape}, dtype={vertices_seq.dtype}; "
         f"faces.shape={shared_faces.shape}, dtype={shared_faces.dtype}"
     )
+    timer.log("save mesh npz")
 
     final_watertight_data["_global"] = {
         "mesh_npz_path": mesh_npz_path,
@@ -1820,13 +1879,29 @@ def process_geometry(args):
         "vertices_dtype": str(vertices_seq.dtype),
         "faces_dtype": str(shared_faces.dtype),
         "image_storage_layout": "per_camera_dir/frame_png",
-
         "root_body_motion_removed_by": "per-frame bbox-center translation",
-
         "sequence_global_scale": float(sequence_scale),
         "canonical_bbox_min": canonical_bbox_min.tolist(),
         "canonical_bbox_max": canonical_bbox_max.tolist(),
-
+        "raw_action_frame_start": int(raw_frame_start),
+        "raw_action_frame_end": int(raw_frame_end),
+        "selected_frame_start": int(frame_indices[0]),
+        "selected_frame_end": int(frame_indices[-1]),
+        "umeyama_motion_trim": {
+            "enabled": bool(motion_trim_summary["enabled"]),
+            "umeyama_json_found": bool(motion_trim_summary["umeyama_json_found"]),
+            "umeyama_json_path": motion_trim_summary["umeyama_json_path"],
+            "motion_rms_threshold": float(args.motion_rms_threshold),
+            "trim_reason": motion_trim_summary["trim_reason"],
+            "keep_start_frame": int(motion_trim_summary["keep_start_frame"]),
+            "keep_end_frame": int(motion_trim_summary["keep_end_frame"]),
+            "num_frames_before_trim": int(motion_trim_summary["num_frames_before_trim"]),
+            "num_frames_after_trim": int(motion_trim_summary["num_frames_after_trim"]),
+            "num_head_frames_removed": int(motion_trim_summary["num_head_frames_removed"]),
+            "num_tail_frames_removed": int(motion_trim_summary["num_tail_frames_removed"]),
+            "missing_frames_count": int(motion_trim_summary["missing_frames_count"]),
+            "missing_frames_example": [int(x) for x in motion_trim_summary["missing_frames_example"]],
+        },
         "num_cameras": int(args.num_cameras),
         "camera_seed": int(camera_seed),
         "camera_elev_min_deg": float(args.camera_elev_min_deg),
@@ -1834,20 +1909,14 @@ def process_geometry(args):
         "camera_frame_padding": float(args.camera_frame_padding),
         "camera_fit_safety": float(args.camera_fit_safety),
         "camera_distance_jitter_scale": float(args.camera_distance_jitter_scale),
-
         "camera_distance_method": (
-            "per-view camera-space sequence bbox + "
-            "view-specific bbox normalization + "
-            "tight distance estimation"
+            "per-view camera-space sequence bbox + view-specific bbox normalization + tight distance estimation"
         ),
-
         "randomize_camera_intrinsics": bool(args.randomize_camera_intrinsics),
         "camera_fov_min_deg": float(args.camera_fov_min_deg),
         "camera_fov_max_deg": float(args.camera_fov_max_deg),
         "camera_sensor_size_mm": float(args.camera_sensor_size),
-
         "static_cameras": camera_infos,
-
         "render_scene_box": bool(args.render_scene_box),
         "scene_box_affect_normal": bool(args.scene_box_affect_normal),
         "scene_box_thickness": float(args.scene_box_thickness),
@@ -1856,7 +1925,6 @@ def process_geometry(args):
         "rendered_scene_box_space": "shared_world_canonical_bbox",
         "bbox_min": canonical_bbox_min.astype(np.float32).tolist(),
         "bbox_max": canonical_bbox_max.astype(np.float32).tolist(),
-
         "lighting_mode": "per_camera_fixed_lighting_over_time",
         "lighting_seed": int(lighting_seed),
         "sunlight_prob": float(args.sunlight_prob),
@@ -1864,38 +1932,36 @@ def process_geometry(args):
         "hdr_strength_min": float(hdr_strength_min),
         "hdr_strength_max": float(hdr_strength_max),
         "per_camera_lighting": per_camera_lighting,
-
         "imported_light_objects": lighting_controller["imported_lights_summary"],
         "removed_imported_lights": [],
+        "optimization_notes": {
+            "raw_vertices_cached_in_first_pass": True,
+            "mesh_extraction_uses_foreach_get": True,
+            "hdr_world_reused": True,
+            "save_compressed_mesh": bool(args.save_compressed_mesh),
+            "cycles_use_denoising": bool(args.cycles_use_denoising),
+        },
     }
 
     print(f"Saving final metadata to {output_file}...")
     os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
-    with open(output_file, "w") as fw:
+    with open(output_file, "w", encoding="utf-8") as fw:
         fw.write(json.dumps(final_watertight_data, indent=2))
+    timer.log("save metadata json")
     print("--- Processing Complete ---")
 
 
-# =================================================================================
-#  7. MAIN
-# =================================================================================
+# =====================================================================================
+# 7. MAIN
+# =====================================================================================
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Generate multi-view rendered frames, shared-topology mesh npz, per-keyframe mesh ply, and optionally a normalized GLB from animated GLB/GLTF files using Blender."
     )
-    parser.add_argument(
-        "--object_path",
-        type=str,
-        required=True,
-        help="Path to the source .glb/.gltf file.",
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        required=True,
-        help="Path to the output metadata .json file.",
-    )
+    parser.add_argument("--object_path", type=str, required=True, help="Path to the source .glb/.gltf file.")
+    parser.add_argument("--output_file", type=str, required=True, help="Path to the output metadata .json file.")
     parser.add_argument(
         "--normalized_glb_path",
         type=str,
@@ -1903,12 +1969,7 @@ if __name__ == "__main__":
         help="Optional path to export the normalized animated scene and static cameras as a new .glb file.",
     )
 
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=512,
-        help="Render resolution for output PNGs. This script uses square output: resolution x resolution.",
-    )
+    parser.add_argument("--resolution", type=int, default=512, help="Square render resolution.")
     parser.add_argument(
         "--render_engine",
         type=str,
@@ -1916,134 +1977,32 @@ if __name__ == "__main__":
         choices=["BLENDER_EEVEE", "CYCLES"],
         help="Blender render engine.",
     )
-    parser.add_argument(
-        "--transparent_bg",
-        action="store_true",
-        help="Render with transparent background.",
-    )
+    parser.add_argument("--transparent_bg", action="store_true", help="Render with transparent background.")
 
-    parser.add_argument(
-        "--hdr_dir",
-        type=str,
-        default="data/hdr",
-        help="Directory containing HDR environment maps (*.exr / *.hdr).",
-    )
-    parser.add_argument(
-        "--hdr_strength",
-        type=float,
-        default=None,
-        help="Deprecated compatibility option. If set, it overrides hdr_strength_min/max with a fixed value.",
-    )
-    parser.add_argument(
-        "--hdr_strength_min",
-        type=float,
-        default=0.2,
-        help="Minimum HDR strength for per-camera random HDR lighting.",
-    )
-    parser.add_argument(
-        "--hdr_strength_max",
-        type=float,
-        default=0.5,
-        help="Maximum HDR strength for per-camera random HDR lighting.",
-    )
-    parser.add_argument(
-        "--hdr_seed",
-        type=int,
-        default=None,
-        help="Optional lighting random seed. If not provided, it is derived from traj_seed and traj_id.",
-    )
-    parser.add_argument(
-        "--sunlight_prob",
-        type=float,
-        default=0.05,
-        help="Per-camera probability of using sunlight instead of HDR environment lighting.",
-    )
-    parser.add_argument(
-        "--sunlight_energy",
-        type=float,
-        default=3.0,
-        help="Energy of the dedicated sunlight when sunlight lighting mode is selected.",
-    )
+    parser.add_argument("--hdr_dir", type=str, default="data/hdr", help="Directory containing HDR maps.")
+    parser.add_argument("--hdr_strength", type=float, default=None)
+    parser.add_argument("--hdr_strength_min", type=float, default=0.2)
+    parser.add_argument("--hdr_strength_max", type=float, default=0.5)
+    parser.add_argument("--hdr_seed", type=int, default=None)
+    parser.add_argument("--sunlight_prob", type=float, default=0.05)
+    parser.add_argument("--sunlight_energy", type=float, default=3.0)
 
-    parser.add_argument(
-        "--traj_id",
-        type=int,
-        default=0,
-        help="Used only to derive a reproducible camera seed.",
-    )
-    parser.add_argument(
-        "--traj_seed",
-        type=int,
-        default=0,
-        help="Base random seed for static multi-view camera generation.",
-    )
+    parser.add_argument("--traj_id", type=int, default=0)
+    parser.add_argument("--traj_seed", type=int, default=0)
 
-    parser.add_argument(
-        "--num_cameras",
-        type=int,
-        default=16,
-        help="Number of static cameras per frame.",
-    )
-    parser.add_argument(
-        "--camera_elev_min_deg",
-        type=float,
-        default=0.0,
-        help="Minimum elevation in degrees for static cameras.",
-    )
-    parser.add_argument(
-        "--camera_elev_max_deg",
-        type=float,
-        default=80.0,
-        help="Maximum elevation in degrees for static cameras.",
-    )
-    parser.add_argument(
-        "--camera_frame_padding",
-        type=float,
-        default=0.03,
-        help="Fractional padding to leave around the object in the image. Smaller => object fills more of the frame.",
-    )
-    parser.add_argument(
-        "--camera_fit_safety",
-        type=float,
-        default=1.02,
-        help="Small multiplicative safety factor for tight-fit camera distance.",
-    )
-    parser.add_argument(
-        "--camera_distance_jitter_scale",
-        type=float,
-        default=1.04,
-        help="Extra outward distance jitter relative to the tight-fit distance. 1.0 means no jitter.",
-    )
+    parser.add_argument("--num_cameras", type=int, default=16)
+    parser.add_argument("--camera_elev_min_deg", type=float, default=0.0)
+    parser.add_argument("--camera_elev_max_deg", type=float, default=80.0)
+    parser.add_argument("--camera_frame_padding", type=float, default=0.03)
+    parser.add_argument("--camera_fit_safety", type=float, default=1.02)
+    parser.add_argument("--camera_distance_jitter_scale", type=float, default=1.04)
 
-    parser.add_argument(
-        "--randomize_camera_intrinsics",
-        action="store_true",
-        help="If set, each camera samples its own common FOV while keeping fovx = fovy.",
-    )
-    parser.add_argument(
-        "--camera_fov_min_deg",
-        type=float,
-        default=35.0,
-        help="Minimum sampled common FOV in degrees when randomizing camera intrinsics.",
-    )
-    parser.add_argument(
-        "--camera_fov_max_deg",
-        type=float,
-        default=70.0,
-        help="Maximum sampled common FOV in degrees when randomizing camera intrinsics.",
-    )
-    parser.add_argument(
-        "--camera_sensor_size",
-        type=float,
-        default=36.0,
-        help="Square sensor size in mm. sensor_width = sensor_height = this value.",
-    )
+    parser.add_argument("--randomize_camera_intrinsics", action="store_true")
+    parser.add_argument("--camera_fov_min_deg", type=float, default=35.0)
+    parser.add_argument("--camera_fov_max_deg", type=float, default=70.0)
+    parser.add_argument("--camera_sensor_size", type=float, default=36.0)
 
-    parser.add_argument(
-        "--export_keyframe_ply",
-        action="store_true",
-        help="If set, export one normalized mesh PLY for each detected keyframe.",
-    )
+    parser.add_argument("--export_keyframe_ply", action="store_true")
 
     parser.add_argument(
         "--cycles_backend",
@@ -2052,42 +2011,48 @@ if __name__ == "__main__":
         choices=["CUDA", "OPTIX"],
         help="Cycles GPU backend.",
     )
-
+    parser.add_argument("--cycles_samples", type=int, default=256)
     parser.add_argument(
-        "--render_scene_box",
+        "--cycles_use_denoising",
         action="store_true",
-        help="If set, render the canonical normalized scene box as a wireframe cube.",
+        help="Enable Cycles denoising. Default is off in this optimized version.",
     )
     parser.add_argument(
-        "--scene_box_affect_normal",
+        "--disable_adaptive_sampling",
         action="store_true",
-        help="If set, the rendered scene box will also appear in normal maps. Default is False.",
+        help="Disable Cycles adaptive sampling.",
     )
     parser.add_argument(
-        "--scene_box_thickness",
-        type=float,
-        default=0.004,
-        help="Wireframe thickness of the rendered scene box in canonical scene units.",
-    )
-    parser.add_argument(
-        "--scene_box_color",
-        type=float,
-        nargs=3,
-        default=[1.0, 0.2, 0.2],
-        metavar=("R", "G", "B"),
-        help="RGB color of the rendered scene box.",
-    )
-    parser.add_argument(
-        "--scene_box_emission_strength",
-        type=float,
-        default=1.5,
-        help="Emission strength of the scene box material.",
+        "--save_compressed_mesh",
+        action="store_true",
+        help="Use np.savez_compressed for mesh npz. Default is faster uncompressed np.savez.",
     )
 
+    parser.add_argument("--render_scene_box", action="store_true")
+    parser.add_argument("--scene_box_affect_normal", action="store_true")
+    parser.add_argument("--scene_box_thickness", type=float, default=0.004)
+    parser.add_argument("--scene_box_color", type=float, nargs=3, default=[1.0, 0.2, 0.2], metavar=("R", "G", "B"))
+    parser.add_argument("--scene_box_emission_strength", type=float, default=1.5)
+    parser.add_argument("--debug_camera_projection", action="store_true")
+
     parser.add_argument(
-        "--debug_camera_projection",
-        action="store_true",
-        help="If set, print projected camera-space sequence bbox corners for each camera on the first frame.",
+        "--motion_info_root",
+        type=str,
+        default="data/objverse_minghao_4d_mine/motion_info",
+        help="Root dir of motion_info. Expected path: <motion_info_root>/<chunk>/<object_id>/umeyama_similarity.json",
+    )
+    parser.add_argument(
+        "--motion_rms_threshold",
+        type=float,
+        default=0.001,
+        help="Use rms_error > threshold to determine whether a frame has motion.",
+    )
+    parser.add_argument(
+        "--cycles_device",
+        type=str,
+        default="GPU",
+        choices=["GPU", "CPU"],
+        help="Cycles rendering device. Use CPU for CPU-only rendering.",
     )
 
     args = parser.parse_args(get_cli_argv())

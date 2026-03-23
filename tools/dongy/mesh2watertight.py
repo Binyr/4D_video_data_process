@@ -14,7 +14,7 @@
 #  code builder: Dora team (https://github.com/Seed3D/Dora)
 import cubvh
 # from data_process_batch_single import xyz_to_n
-from .helper_wt import compute_valid_udf
+from helper_wt import compute_valid_udf
 import torch
 import numpy as np
 import trimesh
@@ -346,14 +346,9 @@ def cubvh_mesh2watertightsdf(mesh_v,mesh_f, output_resolution=1024):
     vertices = mesh_v
     triangles = mesh_f
     
-    # vertices , bcenter, radius = sphere_normalize_torch_rescale(vertices)
-    bcenter = torch.tensor(0.)
-    radius = torch.tensor(1.0)
-    # vertices = vertices * 0.95
-    # mesh_scale *= 0.95
-    # import pdb;pdb.set_trace()
-    # mesh = trimesh.Trimesh(vertices=vertices.cpu().numpy(), faces=mesh_f.cpu().numpy(), process=False)
-
+    vertices , bcenter, radius = sphere_normalize_torch_rescale(vertices)
+    vertices = vertices * 0.95
+    mesh_scale *= 0.95
     # mesh_scale 
     mesh_scale /= radius.item()
     BVH = cubvh.cuBVH(vertices, triangles)
@@ -403,7 +398,7 @@ def cubvh_mesh2watertightsdf(mesh_v,mesh_f, output_resolution=1024):
     vertices = vertices / (sdf.shape[-1] - 1.0) * 2 - 1
     vertices = vertices.to(torch.float32)
     triangles = triangles.to(torch.int32)
-    mesh = trimesh.Trimesh(vertices=vertices.cpu().numpy(), faces=triangles.cpu().numpy(), process=False)
+    # mesh = trimesh.Trimesh(vertices=vertices.cpu().numpy(), faces=triangles.cpu().numpy(), process=False)
     sdf_sign = sdf.sign()
     # sdf_sign = sdf.sign()[0::2,0::2,0::2]
     # sdf_sign = sdf_sign.to(torch.float16)
@@ -444,7 +439,7 @@ def cubvh_mesh2watertightsdf(mesh_v,mesh_f, output_resolution=1024):
     sparse_sdf = sparse_sdf*sss
     del new_sdf
     # breakpoint()
-    sparse_index = xyz_to_n(sparse_index, resolution_bits=int(np.log2(resolution)))
+    sparse_index = xyz_to_n(sparse_index, resolution_bits=9)
     sparse_index = sparse_index.cpu().numpy()
     sparse_sdf = sparse_sdf.to(torch.float16).cpu().numpy()
     # del new_udf
@@ -481,7 +476,7 @@ def cubvh_mesh2watertightsdf(mesh_v,mesh_f, output_resolution=1024):
     # watertight_mesh_unnormalized_new_vertices = watertight_mesh_unnormalized_new_vertices.cpu().numpy()
     # new_triangles = new_triangles.cpu().numpy()
     # watertight_mesh_unnormalized_new = trimesh.Trimesh(vertices=watertight_mesh_unnormalized_new_vertices, faces=new_triangles, process=False)  
-    return mesh, sparse_sdf,sparse_index, mesh_scale,sdf_sign
+    return None, sparse_sdf,sparse_index, mesh_scale, sdf_sign
     
 
 
