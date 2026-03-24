@@ -5,6 +5,7 @@ import argparse
 import re
 import tarfile
 from pathlib import Path
+from tqdm import tqdm
 
 
 def natural_key(s: str):
@@ -12,10 +13,6 @@ def natural_key(s: str):
 
 
 def has_complete_mp4_views(mp4_dir: Path, num_views: int = 16) -> bool:
-    """
-    检查 mp4_dir 下是否完整存在:
-      view_00.mp4, view_01.mp4, ..., view_15.mp4
-    """
     if not mp4_dir.exists() or not mp4_dir.is_dir():
         return False
 
@@ -27,13 +24,6 @@ def has_complete_mp4_views(mp4_dir: Path, num_views: int = 16) -> bool:
 
 
 def is_valid_object_dir(obj_dir: Path, num_views: int = 16) -> bool:
-    """
-    条件：
-      1. result.json 存在
-      2. result_mesh.npz 存在
-      3. result_rgb_mp4 下 16 个 view_xx.mp4 都存在
-      4. result_normal_mp4 下 16 个 view_xx.mp4 都存在
-    """
     result_json = obj_dir / "result.json"
     result_mesh = obj_dir / "result_mesh.npz"
     rgb_dir = obj_dir / "result_rgb_mp4"
@@ -61,9 +51,11 @@ def find_valid_object_dirs(input_root: Path, chunk_dirs=None, num_views: int = 1
 
     candidate_chunks = sorted(candidate_chunks, key=lambda p: natural_key(p.name))
 
-    for chunk_dir in candidate_chunks:
+    print(f"[Info] Total chunks to scan: {len(candidate_chunks)}")
+
+    for chunk_dir in tqdm(candidate_chunks, desc="Scanning chunks", unit="chunk"):
         if not chunk_dir.exists():
-            print(f"[Warning] chunk dir not found: {chunk_dir}")
+            tqdm.write(f"[Warning] chunk dir not found: {chunk_dir}")
             continue
         if not chunk_dir.is_dir():
             continue
@@ -71,7 +63,12 @@ def find_valid_object_dirs(input_root: Path, chunk_dirs=None, num_views: int = 1
         object_dirs = [p for p in chunk_dir.iterdir() if p.is_dir()]
         object_dirs = sorted(object_dirs, key=lambda p: natural_key(p.name))
 
-        for obj_dir in object_dirs:
+        for obj_dir in tqdm(
+            object_dirs,
+            desc=f"{chunk_dir.name}",
+            unit="obj",
+            leave=False,
+        ):
             if is_valid_object_dir(obj_dir, num_views=num_views):
                 valid_object_dirs.append(obj_dir)
 
@@ -88,13 +85,6 @@ def add_required_files_to_tar(
     input_root: Path,
     num_views: int = 16,
 ):
-    """
-    只把通过校验所需的文件加入 tar:
-      - result.json
-      - result_mesh.npz
-      - result_rgb_mp4/view_00~15.mp4
-      - result_normal_mp4/view_00~15.mp4
-    """
     required_files = [
         obj_dir / "result.json",
         obj_dir / "result_mesh.npz",
@@ -189,9 +179,9 @@ def main():
         raise FileNotFoundError(f"input_root not found: {input_root}")
 
     print(f"[Info] Scanning: {input_root}")
-    print(f"[Info] Valid object condition:")
-    print(f"       - result.json exists")
-    print(f"       - result_mesh.npz exists")
+    print("[Info] Valid object condition:")
+    print("       - result.json exists")
+    print("       - result_mesh.npz exists")
     print(f"       - result_rgb_mp4 has {args.num_views} mp4 views")
     print(f"       - result_normal_mp4 has {args.num_views} mp4 views")
 
@@ -222,8 +212,8 @@ def main():
         save_manifest(valid_object_dirs, input_root, Path(args.manifest_path).resolve())
 
     print(f"[Info] Writing tar: {output_tar}")
-    with tarfile.open(output_tar, mode="w") as tar:  # 不压缩
-        for idx, obj_dir in enumerate(valid_object_dirs, 1):
+    with tarfile.open(output_tar, mode="w") as tar:
+        for obj_dir in tqdm(valid_object_dirs, desc="Packing tar", unit="obj"):
             rel_obj_dir = obj_dir.relative_to(input_root)
 
             if args.pack_mode == "dir":
@@ -237,9 +227,6 @@ def main():
                 )
             else:
                 raise ValueError(f"Unknown pack_mode: {args.pack_mode}")
-
-            if idx % 100 == 0 or idx == len(valid_object_dirs):
-                print(f"[Info] Packed {idx}/{len(valid_object_dirs)}")
 
     print("[Done]")
     print(f"[Done] Tar saved to: {output_tar}")

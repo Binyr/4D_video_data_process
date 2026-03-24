@@ -14,6 +14,7 @@ from tqdm import tqdm
 from direct3d_s2.utils import normalize_mesh, mesh2index
 from direct3d_s2.modules import sparse as sp
 from tools.utils.mesh2watertight_video import cubvh_mesh2watertightsd_vid, n_to_xyz
+import gc
 
 weight_type = torch.float16
 device = "cuda:0"
