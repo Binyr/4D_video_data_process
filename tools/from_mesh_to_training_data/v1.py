@@ -55,7 +55,7 @@ for ic, c2w in enumerate(camera_c2ws_bl):
     # transform mesh vertics to camera space
     w2c = np.linalg.inv(c2w)
     print(w2c.round(3))
-    continue
+
     w2c_rot_np = w2c[:3, :3]
     w2c_rot = torch.from_numpy(w2c_rot_np).float().cuda()
     for i, f_i in tqdm(enumerate(f_indices), desc=root.name):
@@ -65,6 +65,7 @@ for ic, c2w in enumerate(camera_c2ws_bl):
             print("before", mesh_v.mean())
             mesh_v = torch.matmul(mesh_v, w2c_rot.T)
             print("after", mesh_v.mean())
+
             resolution = 512
             mesh_wt, sparse_sdf, sparse_index, mesh_scale, sdf_sign = cubvh_mesh2watertightsd_vid(mesh_v, mesh_f, resolution)
             # save_path = Path(root.replace("rendering_v5", "train_data"))

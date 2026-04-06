@@ -348,12 +348,18 @@ def build_blender_cmd(task: Task, args) -> List[str]:
         str(args.camera_sensor_size),
         "--sunlight_prob",
         str(args.sunlight_prob),
+        "--camera_stride",
+        str(2),
+        "--no_render_normal_map",
     ]
 
     if args.transparent_bg:
         cmd.append("--transparent_bg")
     if args.randomize_camera_intrinsics:
         cmd.append("--randomize_camera_intrinsics")
+    if "--cycles_use_denoising" in args.extra_worker_args:
+        args.extra_worker_args.remove("--cycles_use_denoising")
+    # print(type(args.extra_worker_args), args.extra_worker_args)
     if args.extra_worker_args:
         cmd.extend(args.extra_worker_args)
 

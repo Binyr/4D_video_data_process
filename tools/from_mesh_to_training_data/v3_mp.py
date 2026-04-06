@@ -10,25 +10,116 @@ import math
 import argparse
 import subprocess
 from typing import List, Dict
-
+from tqdm import tqdm
 
 # 让脚本能 import 项目内模块
 f_path = Path(__file__).absolute()
 p_path = f_path.parents[2]
 sys.path.insert(0, str(p_path))
 
-# DEFAULT_ANNS_JSON = "/group/40075/yanruibin/objverse_minghao_4d_mine/rendering_v5_anns_1.3k.json"
-# DEFAULT_DATASET_ROOT = "/group/40075/yanruibin/objverse_minghao_4d_mine/rendering_v5"
-# DEFAULT_OUTPUT_ROOT = "data/train_data_40075_objverse_minghao_4d_mine_rendering_v5"
 
-DEFAULT_ANNS_JSON = "data/objverse_minghao_4d_mine_40075/rendering_v5_anns_1.3k.json"
-DEFAULT_DATASET_ROOT = "data/objverse_minghao_4d_mine_40075/rendering_v5"
-DEFAULT_OUTPUT_ROOT = "data/train_data_40075_objverse_minghao_4d_mine_rendering_v5"
+DEFAULT_ANNS_JSON = "/group/40075/yanruibin/objverse_minghao_4d_mine/rendering_v5_anns_1.3k.json"
+DEFAULT_DATASET_ROOT = "/group/40075/yanruibin/objverse_minghao_4d_mine/rendering_v5"
+DEFAULT_OUTPUT_ROOT = "data/train_data_40075_objverse_minghao_4d_mine_rendering_v5_512_4camera"
+
+
+def load_camera_c2ws_from_result_json(result_json_path: Path):
+    """
+    兼容两种 meta 格式，返回按 view_index 排序后的 camera_c2w list
+    """
+    if not result_json_path.exists():
+        raise FileNotFoundError(f"result.json not found: {result_json_path}")
+
+    with open(result_json_path, "r", encoding="utf-8") as f:
+        metas = json.load(f)
+
+    camera_c2ws_bl = []
+
+    if "_global" in metas:
+        # new meta format
+        metas_global = metas["_global"]
+        cameras = metas_global["static_cameras"]
+        cameras = sorted(cameras, key=lambda x: int(x["view_index"]))
+        for camera in cameras:
+            camera_c2ws_bl.append(camera["camera_c2w"])
+    else:
+        # old meta format
+        # 旧格式通常是: {frame_xxx: {"views": [...]}, ...}
+        first_key = next(iter(metas))
+        views = metas[first_key]["views"]
+        views = sorted(views, key=lambda x: int(x["view_index"]))
+        for view in views:
+            camera_c2ws_bl.append(view["camera_c2w"])
+
+    return camera_c2ws_bl
+
+
+def iter_selected_view_indices(num_views: int, view_stride: int, view_offset: int):
+    for ic in range(num_views):
+        if ic % view_stride != view_offset:
+            continue
+        yield ic
+
+
+def object_is_fully_done(
+    root: Path,
+    dataset_root: Path,
+    output_root: Path,
+    resolution: int,
+    view_stride: int,
+    view_offset: int,
+) -> bool:
+    """
+    判断一个 object 是否已经完整完成：
+    对所有被选中的视角、所有 frame，都已经存在
+    sparse_sdf_{resolution}_{frame_tag}.npz 和 sdf_sign_{resolution}_{frame_tag}.npz
+    """
+    import numpy as np
+
+    mesh_path = root / "result_mesh.npz"
+    result_json_path = root / "result.json"
+
+    if (not mesh_path.exists()) or (not result_json_path.exists()):
+        return False
+
+    camera_c2ws_bl = load_camera_c2ws_from_result_json(result_json_path)
+    if len(camera_c2ws_bl) == 0:
+        return False
+
+    rel_obj_dir = root.relative_to(dataset_root)
+    save_obj_dir = output_root / rel_obj_dir
+    if not save_obj_dir.exists():
+        return False
+
+    npz = np.load(mesh_path, mmap_mode="r")
+    try:
+        f_indices = np.array(npz["frame_indices"])
+    finally:
+        del npz
+
+    for ic in iter_selected_view_indices(len(camera_c2ws_bl), view_stride, view_offset):
+        view_dir = save_obj_dir / f"view_{str(ic).zfill(2)}"
+        # for i in range(len(f_indices)):
+        if True:
+            i = len(f_indices) - 1
+            frame_tag = str(int(i)).zfill(3)
+            sdf_path = view_dir / f"sparse_sdf_{resolution}_{frame_tag}.npz"
+            sign_path = view_dir / f"sdf_sign_{resolution}_{frame_tag}.npz"
+            if (not sdf_path.exists()) or (not sign_path.exists()):
+                return False
+
+    return True
 
 
 def load_object_dirs_from_anns(
     anns_json: Path,
     splits: List[str],
+    dataset_root: Path = None,
+    output_root: Path = None,
+    resolution: int = None,
+    view_stride: int = 1,
+    view_offset: int = 0,
+    only_unfinished: bool = False,
 ) -> List[Path]:
     with open(anns_json, "r", encoding="utf-8") as f:
         anns = json.load(f)
@@ -50,6 +141,34 @@ def load_object_dirs_from_anns(
         if s not in seen:
             seen.add(s)
             uniq.append(p)
+
+    if only_unfinished:
+        if dataset_root is None or output_root is None or resolution is None:
+            raise ValueError(
+                "When only_unfinished=True, dataset_root/output_root/resolution must be provided."
+            )
+
+        filtered = []
+        for p in tqdm(uniq, desc="scanning existing"):
+            try:
+                if not object_is_fully_done(
+                    root=p,
+                    dataset_root=dataset_root,
+                    output_root=output_root,
+                    resolution=resolution,
+                    view_stride=view_stride,
+                    view_offset=view_offset,
+                ):
+                    filtered.append(p)
+            except Exception as e:
+                # 判断失败时保留，避免误跳过
+                print(f"[load_object_dirs_from_anns] Warning: failed to check {p}: {repr(e)}")
+                filtered.append(p)
+
+        print(f"[load_object_dirs_from_anns] total from anns     : {len(uniq)}")
+        print(f"[load_object_dirs_from_anns] unfinished objects : {len(filtered)}")
+        return filtered
+
     return uniq
 
 
@@ -97,6 +216,12 @@ def run_launcher(args):
     object_dirs = load_object_dirs_from_anns(
         anns_json=anns_json,
         splits=args.splits,
+        dataset_root=dataset_root,
+        output_root=output_root,
+        resolution=args.resolution,
+        view_stride=args.view_stride,
+        view_offset=args.view_offset,
+        only_unfinished=True,
     )
 
     if args.start_idx is not None or args.end_idx is not None:
@@ -130,6 +255,8 @@ def run_launcher(args):
     print(f"[Launcher] num_chunks  : {args.num_chunks}")
     print(f"[Launcher] chunk_id    : {args.chunk_id}")
     print(f"[Launcher] total objs to run: {len(object_dirs)}")
+    print(f"[Launcher] view_stride : {args.view_stride}")
+    print(f"[Launcher] view_offset : {args.view_offset}")
 
     if len(object_dirs) == 0:
         print("[Launcher] No object dirs to process. Exit.")
@@ -153,7 +280,7 @@ def run_launcher(args):
 
         shard_json = shard_dir / f"shard_worker{worker_rank}_gpu{gpu_id}{chunk_suffix}.json"
         save_shard_json(shard, shard_json)
-        print(sys.executable)
+
         cmd = [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -164,6 +291,8 @@ def run_launcher(args):
             "--dataset_root", str(dataset_root),
             "--output_root", str(output_root),
             "--resolution", str(args.resolution),
+            "--view_stride", str(args.view_stride),
+            "--view_offset", str(args.view_offset),
         ]
         if args.overwrite:
             cmd.append("--overwrite")
@@ -172,13 +301,10 @@ def run_launcher(args):
         if args.save_failures:
             cmd.append("--save_failures")
 
-        chunk_suffix = ""
-        if args.num_chunks is not None:
-            chunk_suffix = f"_chunk{args.chunk_id}of{args.num_chunks}"
-
         log_path = output_root / f"worker_{worker_rank}_gpu{gpu_id}{chunk_suffix}.log"
         print(f"[Launcher] Start worker {worker_rank} | GPU {gpu_id} | objs {len(shard)}")
         print(f"[Launcher] Log -> {log_path}")
+
         with open(log_path, "w", encoding="utf-8") as log_f:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
@@ -216,6 +342,8 @@ def run_worker(args):
     dataset_root = Path(args.dataset_root).resolve()
     output_root = Path(args.output_root).resolve()
     resolution = args.resolution
+    view_stride = args.view_stride
+    view_offset = args.view_offset
 
     with open(shard_json, "r", encoding="utf-8") as f:
         object_dirs = [Path(x) for x in json.load(f)]
@@ -232,6 +360,8 @@ def run_worker(args):
     print(f"[Worker {worker_rank}] dataset_root = {dataset_root}")
     print(f"[Worker {worker_rank}] output_root = {output_root}")
     print(f"[Worker {worker_rank}] resolution = {resolution}")
+    print(f"[Worker {worker_rank}] view_stride = {view_stride}")
+    print(f"[Worker {worker_rank}] view_offset = {view_offset}")
 
     failures: List[Dict] = []
 
@@ -239,15 +369,6 @@ def run_worker(args):
         if isinstance(x, torch.Tensor):
             return x.detach().cpu().numpy()
         return x
-
-    def object_is_fully_done(save_dir: Path, frame_indices) -> bool:
-        for f_i in frame_indices:
-            frame_tag = str(int(f_i)).zfill(2)
-            sdf_path = save_dir / f"sparse_sdf_{resolution}_{frame_tag}.npz"
-            sign_path = save_dir / f"sdf_sign_{resolution}_{frame_tag}.npz"
-            if (not sdf_path.exists()) or (not sign_path.exists()):
-                return False
-        return True
 
     for root in tqdm(object_dirs, desc=f"worker{worker_rank}", dynamic_ncols=True):
         try:
@@ -259,85 +380,99 @@ def run_worker(args):
             if not mesh_path.exists():
                 raise FileNotFoundError(f"result_mesh.npz not found: {mesh_path}")
 
+            result_json_path = root / "result.json"
+            camera_c2ws_bl = load_camera_c2ws_from_result_json(result_json_path)
+            if len(camera_c2ws_bl) == 0:
+                raise RuntimeError(f"No cameras found in {result_json_path}")
+
             # 保持和 input 一致的目录结构:
             # input : dataset_root/xxx-xxx/object_id
-            # output: output_root /xxx-xxx/object_id
+            # output: output_root / xxx-xxx/object_id
             rel_obj_dir = root.relative_to(dataset_root)
-            save_dir = output_root / rel_obj_dir
-            save_dir.mkdir(exist_ok=True, parents=True)
+            save_obj_dir = output_root / rel_obj_dir
+            save_obj_dir.mkdir(exist_ok=True, parents=True)
 
             npz = np.load(mesh_path, mmap_mode="r")
             mesh_v_list = npz["vertices"]      # T N 3
             mesh_f_np = npz["faces"]           # F 3
             f_indices = np.array(npz["frame_indices"])
 
-            # load camera
-            camera_c2ws_bl = []
-            result_json_path = f"{root}/result.json"
-            with open(result_json_path) as f:
-                metas = json.load(f)
-                if "_global" in metas:
-                    metas = metas["_global"]
-                    # new meta format
-                    cameras = metas["static_cameras"]
-                    cameras.sort(key=lambda x: int(x["view_index"]))
-                    for camera in cameras:
-                        camera_c2ws_bl.append(np.array(camera["camera_c2w"]))
-                else:
-                    # old meta format
-                    views = list(metas.values())[0]["views"]
-                    views.sort(lambda x: x["view_index"])
-                    for view in metas:
-                        camera_c2ws_bl.append(np.array(camera["camera_c2w"]))
-
-            if args.skip_existing_object and object_is_fully_done(save_dir, f_indices):
+            if args.skip_existing_object and object_is_fully_done(
+                root=root,
+                dataset_root=dataset_root,
+                output_root=output_root,
+                resolution=resolution,
+                view_stride=view_stride,
+                view_offset=view_offset,
+            ):
                 print(f"[Worker {worker_rank}] Skip fully done object: {root}")
+                del npz
                 continue
 
             mesh_f = torch.from_numpy(mesh_f_np).to(dtype=torch.int32, device=device)
 
+            # 提前把所有 view 的旋转矩阵准备好
+            view_rot_mats = []
+            for ic, c2w in enumerate(camera_c2ws_bl):
+                c2w = np.asarray(c2w, dtype=np.float32)
+                if c2w.shape != (4, 4):
+                    raise ValueError(f"camera_c2w for view {ic} has invalid shape: {c2w.shape}")
+                w2c = np.linalg.inv(c2w)
+                w2c_rot = torch.from_numpy(w2c[:3, :3]).to(dtype=torch.float32, device=device)
+                view_rot_mats.append(w2c_rot)
+
             with torch.inference_mode():
-                for i, f_i in enumerate(f_indices):
-                    frame_tag = str(int(f_i)).zfill(2)
-                    sdf_path = save_dir / f"sparse_sdf_{resolution}_{frame_tag}.npz"
-                    sign_path = save_dir / f"sdf_sign_{resolution}_{frame_tag}.npz"
+                for ic in iter_selected_view_indices(len(view_rot_mats), view_stride, view_offset):
+                    w2c_rot = view_rot_mats[ic]
+                    view_dir = save_obj_dir / f"view_{str(ic).zfill(2)}"
+                    view_dir.mkdir(exist_ok=True, parents=True)
 
-                    if (not args.overwrite) and sdf_path.exists() and sign_path.exists():
-                        continue
+                    for i, _ in enumerate(f_indices):
+                        frame_tag = str(int(i)).zfill(3)
+                        sdf_path = view_dir / f"sparse_sdf_{resolution}_{frame_tag}.npz"
+                        sign_path = view_dir / f"sdf_sign_{resolution}_{frame_tag}.npz"
 
-                    mesh_v = None
-                    mesh_wt = None
-                    sparse_sdf = None
-                    sparse_index = None
-                    mesh_scale = None
-                    sdf_sign = None
+                        if (not args.overwrite) and sdf_path.exists() and sign_path.exists():
+                            continue
 
-                    try:
-                        mesh_v_np = mesh_v_list[i]
-                        mesh_v = torch.from_numpy(mesh_v_np).to(dtype=torch.float32, device=device)
+                        mesh_v = None
+                        mesh_wt = None
+                        sparse_sdf = None
+                        sparse_index = None
+                        mesh_scale = None
+                        sdf_sign = None
 
-                        mesh_wt, sparse_sdf, sparse_index, mesh_scale, sdf_sign = \
-                            cubvh_mesh2watertightsd_vid(mesh_v, mesh_f, resolution)
+                        try:
+                            mesh_v_np = mesh_v_list[i]
+                            mesh_v = torch.from_numpy(mesh_v_np).to(dtype=torch.float32, device=device)
 
-                        sparse_sdf_np = to_numpy(sparse_sdf)
-                        sparse_index_np = to_numpy(sparse_index)
-                        sdf_sign_np = to_numpy(sdf_sign)
+                            # world -> camera，只做旋转，和你原单进程代码一致
+                            mesh_v = torch.matmul(mesh_v, w2c_rot.T)
 
-                        np.savez_compressed(
-                            sdf_path,
-                            sparse_sdf=sparse_sdf_np,
-                            sparse_index=sparse_index_np,
-                        )
-                        np.savez_compressed(
-                            sign_path,
-                            sdf_sign=sdf_sign_np,
-                        )
+                            mesh_wt, sparse_sdf, sparse_index, mesh_scale, sdf_sign = (
+                                cubvh_mesh2watertightsd_vid(mesh_v, mesh_f, resolution)
+                            )
 
-                    finally:
-                        del mesh_v, mesh_wt, sparse_sdf, sparse_index, mesh_scale, sdf_sign
-                        gc.collect()
-                        torch.cuda.empty_cache()
+                            sparse_sdf_np = to_numpy(sparse_sdf)
+                            sparse_index_np = to_numpy(sparse_index)
+                            sdf_sign_np = to_numpy(sdf_sign)
 
+                            np.savez_compressed(
+                                sdf_path,
+                                sparse_sdf=sparse_sdf_np,
+                                sparse_index=sparse_index_np,
+                            )
+                            np.savez_compressed(
+                                sign_path,
+                                sdf_sign=sdf_sign_np,
+                            )
+
+                        finally:
+                            del mesh_v, mesh_wt, sparse_sdf, sparse_index, mesh_scale, sdf_sign
+                            gc.collect()
+                            torch.cuda.empty_cache()
+
+            del view_rot_mats
             del mesh_f
             del npz
             gc.collect()
@@ -447,12 +582,27 @@ def parse_args():
     parser.add_argument(
         "--skip_existing_object",
         action="store_true",
-        help="If all frames of an object already exist, skip the whole object",
+        help="If all frames of all selected views for an object already exist, skip the whole object",
     )
     parser.add_argument(
         "--save_failures",
         action="store_true",
         help="Save per-worker failures json",
+    )
+
+    # view 选择逻辑
+    parser.add_argument(
+        "--view_stride",
+        type=int,
+        default=1,
+        help="Only process views satisfying (view_idx %% view_stride == view_offset). "
+             "Use 2 + offset=1 to mimic 'if ic %% 2 == 0: continue'.",
+    )
+    parser.add_argument(
+        "--view_offset",
+        type=int,
+        default=0,
+        help="View offset used with --view_stride",
     )
 
     # worker mode
@@ -466,6 +616,15 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.view_stride <= 0:
+        raise ValueError(f"--view_stride must be > 0, got {args.view_stride}")
+    if not (0 <= args.view_offset < args.view_stride):
+        raise ValueError(
+            f"--view_offset must satisfy 0 <= view_offset < view_stride, "
+            f"got view_offset={args.view_offset}, view_stride={args.view_stride}"
+        )
+
     if args.worker:
         run_worker(args)
     else:
@@ -476,24 +635,13 @@ if __name__ == "__main__":
     main()
 
 """
-python tools/from_mesh_to_training_data/submit_mesh_to_training_data.py \
-  --anns_json /group/40075/yanruibin/objverse_minghao_4d_mine/rendering_v5_anns_1.3k.json \
-  --dataset_root /group/40075/yanruibin/objverse_minghao_4d_mine/rendering_v5 \
-  --output_root vis/train_data \
+python tools/from_mesh_to_training_data/v3_mp.py \
   --splits train test \
-  --gpu_ids 0 1 2 3 \
-  --resolution 1024 \
+  --gpu_ids 0 1 2 3 4 5 6 7 \
+  --resolution 512 \
   --num_chunks 3 \
   --chunk_id 0 \
   --skip_existing_object \
-  --save_failures
-
-  python tools/from_mesh_to_training_data/v1_mp.py \
-  --splits train test \
-  --gpu_ids 0 1 2 3 4 5 6 7\
-  --resolution 1024 \
-  --num_chunks 3 \
-  --chunk_id 2 \
-  --skip_existing_object \
-  --save_failures
+  --save_failures \
+  --view_stride 4
 """

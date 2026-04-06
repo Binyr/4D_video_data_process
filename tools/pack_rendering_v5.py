@@ -16,7 +16,7 @@ def has_complete_mp4_views(mp4_dir: Path, num_views: int = 16) -> bool:
     if not mp4_dir.exists() or not mp4_dir.is_dir():
         return False
 
-    for i in range(num_views):
+    for i in range(0, num_views, 2):
         f = mp4_dir / f"view_{i:02d}.mp4"
         if not f.exists():
             return False
@@ -35,8 +35,8 @@ def is_valid_object_dir(obj_dir: Path, num_views: int = 16) -> bool:
         return False
     if not has_complete_mp4_views(rgb_dir, num_views=num_views):
         return False
-    if not has_complete_mp4_views(normal_dir, num_views=num_views):
-        return False
+    # if not has_complete_mp4_views(normal_dir, num_views=num_views):
+    #     return False
 
     return True
 
@@ -90,13 +90,22 @@ def add_required_files_to_tar(
         obj_dir / "result_mesh.npz",
     ]
 
-    for i in range(num_views):
+    for i in range(0, num_views, 2):
         required_files.append(obj_dir / "result_rgb_mp4" / f"view_{i:02d}.mp4")
-        required_files.append(obj_dir / "result_normal_mp4" / f"view_{i:02d}.mp4")
+        # required_files.append(obj_dir / "result_normal_mp4" / f"view_{i:02d}.mp4")
 
     for fpath in required_files:
         relpath = fpath.relative_to(input_root)
         tar.add(str(fpath), arcname=str(relpath))
+    
+    required_dirs = [
+        # obj_dir / "result_meta",
+        # obj_dir / "result_normal_mp4",
+    ]
+    for dpath in required_dirs:
+        if dpath.is_dir():
+            relpath = dpath.relative_to(input_root)
+            tar.add(str(dpath), arcname=str(relpath))
 
 
 def save_manifest(valid_object_dirs, input_root: Path, manifest_path: Path):
