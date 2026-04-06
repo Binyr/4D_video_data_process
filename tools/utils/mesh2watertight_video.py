@@ -454,7 +454,7 @@ def cubvh_mesh2watertightsd_vid(mesh_v, mesh_f, output_resolution=1024):
     # del sdf_sign  # 立即释放，节省~1GB显存
     # del new_BVH
     # del new_points
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
 
     # new_diffmc = DiffMC(dtype=torch.float32).cuda()
     # new_vertices, new_triangles = new_diffmc(new_sdf, isovalue=0, normalize=False)

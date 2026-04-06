@@ -110,26 +110,11 @@ def ensure_pyav_available():
         )
 
 
-
-def get_render_view_indices(num_cameras: int, camera_stride: int) -> List[int]:
-    if num_cameras <= 0:
-        raise ValueError("num_cameras must be > 0")
-    if camera_stride <= 0:
-        raise ValueError("camera_stride must be > 0")
-
-    view_indices = list(range(0, num_cameras, camera_stride))
-    if len(view_indices) == 0:
-        raise ValueError(
-            f"No camera will be rendered: num_cameras={num_cameras}, camera_stride={camera_stride}"
-        )
-    return view_indices
-
-
-def all_view_mp4_exist(video_dir: str, view_indices: List[int]) -> bool:
+def all_view_mp4_exist(video_dir: str, num_cameras: int) -> bool:
     video_dir = Path(video_dir)
     if not video_dir.is_dir():
         return False
-    for view_idx in view_indices:
+    for view_idx in range(num_cameras):
         mp4_path = video_dir / f"view_{view_idx:02d}.mp4"
         if not mp4_path.is_file():
             return False
@@ -324,19 +309,17 @@ def write_16bit_depth_video_streaming_from_pngs(image_paths: List[str], save_pat
         output.close()
 
 
-
 def convert_png_sequences_to_mp4_and_cleanup(
     output_prefix: str,
-    view_indices: List[int],
+    num_cameras: int,
     fps: int = 24,
-    export_normal: bool = True,
 ):
     """
     Convert:
       <prefix>_rgb/view_xx/frame_*.png    -> <prefix>_rgb_mp4/view_xx.mp4
       <prefix>_normal/view_xx/frame_*.png -> <prefix>_normal_mp4/view_xx.mp4
 
-    Only process the cameras in view_indices.
+    After all views are successfully converted, delete <prefix>_rgb and <prefix>_normal.
     """
     rgb_dir = output_prefix + "_rgb"
     normal_dir = output_prefix + "_normal"
@@ -344,26 +327,23 @@ def convert_png_sequences_to_mp4_and_cleanup(
     normal_video_dir = output_prefix + "_normal_mp4"
 
     os.makedirs(rgb_video_dir, exist_ok=True)
-    if export_normal:
-        os.makedirs(normal_video_dir, exist_ok=True)
+    os.makedirs(normal_video_dir, exist_ok=True)
 
     summary = {
         "status": "success",
         "video_fps": int(fps),
-        "render_view_indices": [int(x) for x in view_indices],
-        "render_normal_map": bool(export_normal),
         "rgb_png_root": rgb_dir,
-        "normal_png_root": normal_dir if export_normal else None,
+        "normal_png_root": normal_dir,
         "rgb_video_root": rgb_video_dir,
-        "normal_video_root": normal_video_dir if export_normal else None,
-        "num_rendered_cameras": int(len(view_indices)),
+        "normal_video_root": normal_video_dir,
+        "num_cameras": int(num_cameras),
         "per_view": [],
         "deleted_rgb_png_root": False,
         "deleted_normal_png_root": False,
     }
 
     # ---------------- RGB ----------------
-    for view_idx in view_indices:
+    for view_idx in range(num_cameras):
         view_name = f"view_{view_idx:02d}"
         rgb_view_dir = os.path.join(rgb_dir, view_name)
         rgb_mp4_path = os.path.join(rgb_video_dir, f"{view_name}.mp4")
@@ -377,14 +357,11 @@ def convert_png_sequences_to_mp4_and_cleanup(
             "rgb_mp4_path": rgb_mp4_path,
             "rgb_mp4_exists_before": bool(os.path.isfile(rgb_mp4_path)),
             "rgb_converted_now": False,
-            "normal_png_dir": os.path.join(normal_dir, view_name) if export_normal else None,
-            "normal_num_frames": None,
-            "normal_mp4_path": os.path.join(normal_video_dir, f"{view_name}.mp4") if export_normal else None,
-            "normal_mp4_exists_before": (
-                bool(os.path.isfile(os.path.join(normal_video_dir, f"{view_name}.mp4")))
-                if export_normal else None
-            ),
-            "normal_converted_now": False if export_normal else None,
+            "normal_png_dir": os.path.join(normal_dir, view_name),
+            "normal_num_frames": 0,
+            "normal_mp4_path": os.path.join(normal_video_dir, f"{view_name}.mp4"),
+            "normal_mp4_exists_before": bool(os.path.isfile(os.path.join(normal_video_dir, f"{view_name}.mp4"))),
+            "normal_converted_now": False,
         }
 
         if len(rgb_pngs) > 0:
@@ -406,38 +383,37 @@ def convert_png_sequences_to_mp4_and_cleanup(
         summary["per_view"].append(view_record)
 
     # ---------------- NORMAL ----------------
-    if export_normal:
-        for i, view_idx in enumerate(view_indices):
-            view_name = f"view_{view_idx:02d}"
-            normal_view_dir = os.path.join(normal_dir, view_name)
-            normal_mp4_path = os.path.join(normal_video_dir, f"{view_name}.mp4")
-            normal_pngs = list_png_files_natural(normal_view_dir)
+    for view_idx in range(num_cameras):
+        view_name = f"view_{view_idx:02d}"
+        normal_view_dir = os.path.join(normal_dir, view_name)
+        normal_mp4_path = os.path.join(normal_video_dir, f"{view_name}.mp4")
+        normal_pngs = list_png_files_natural(normal_view_dir)
 
-            summary["per_view"][i]["normal_num_frames"] = int(len(normal_pngs))
+        summary["per_view"][view_idx]["normal_num_frames"] = int(len(normal_pngs))
 
-            if len(normal_pngs) > 0:
-                print(f"[video] Encoding Normal mp4 for {view_name}: {len(normal_pngs)} frames -> {normal_mp4_path}")
-                write_16bit_depth_video_streaming_from_pngs(
-                    normal_pngs,
-                    normal_mp4_path,
-                    fps=fps,
-                    modal="normal",
+        if len(normal_pngs) > 0:
+            print(f"[video] Encoding Normal mp4 for {view_name}: {len(normal_pngs)} frames -> {normal_mp4_path}")
+            write_16bit_depth_video_streaming_from_pngs(
+                normal_pngs,
+                normal_mp4_path,
+                fps=fps,
+                modal="normal",
+            )
+            summary["per_view"][view_idx]["normal_converted_now"] = True
+        else:
+            if not os.path.isfile(normal_mp4_path):
+                raise RuntimeError(
+                    f"Normal PNG sequence is missing and Normal mp4 does not exist for {view_name}. "
+                    f"Missing dir: {normal_view_dir}, missing mp4: {normal_mp4_path}"
                 )
-                summary["per_view"][i]["normal_converted_now"] = True
-            else:
-                if not os.path.isfile(normal_mp4_path):
-                    raise RuntimeError(
-                        f"Normal PNG sequence is missing and Normal mp4 does not exist for {view_name}. "
-                        f"Missing dir: {normal_view_dir}, missing mp4: {normal_mp4_path}"
-                    )
 
-    # Only delete the PNG trees after all rendered views succeed.
-    if all_view_mp4_exist(rgb_video_dir, view_indices) and os.path.isdir(rgb_dir):
+    # Only delete the PNG trees after all views succeed.
+    if all_view_mp4_exist(rgb_video_dir, num_cameras) and os.path.isdir(rgb_dir):
         print(f"[video] Removing RGB PNG directory after successful conversion: {rgb_dir}")
         shutil.rmtree(rgb_dir)
         summary["deleted_rgb_png_root"] = True
 
-    if export_normal and all_view_mp4_exist(normal_video_dir, view_indices) and os.path.isdir(normal_dir):
+    if all_view_mp4_exist(normal_video_dir, num_cameras) and os.path.isdir(normal_dir):
         print(f"[video] Removing Normal PNG directory after successful conversion: {normal_dir}")
         shutil.rmtree(normal_dir)
         summary["deleted_normal_png_root"] = True
@@ -1090,7 +1066,6 @@ def setup_renderer(
     scene.render.image_settings.color_mode = "RGBA" if transparent_bg else "RGB"
     scene.render.film_transparent = transparent_bg
     scene.render.use_file_extension = True
-
     bpy.context.scene.render.use_persistent_data = True
     print(f"bpy.context.scene.cycles.tile_size", bpy.context.scene.cycles.tile_size)
     bpy.context.scene.cycles.tile_size = 8192
@@ -1100,6 +1075,7 @@ def setup_renderer(
     scene.cycles.transparent_max_bounces = 3
     scene.cycles.transmission_bounces = 3
     bpy.context.scene.render.filter_size = 1.5
+    
 
     if engine == "CYCLES":
         scene.cycles.device = str(cycles_device).upper()
@@ -1111,7 +1087,7 @@ def setup_renderer(
     elif engine == "BLENDER_EEVEE":
         if hasattr(scene.eevee, "taa_render_samples"):
             scene.eevee.taa_render_samples = int(cycles_samples)
-
+    print("scene.cycles.use_adaptive_sampling", scene.cycles.use_adaptive_sampling, scene.cycles.adaptive_threshold)
 
 def create_sun_light(name="SunLight", energy=3.0):
     light_data = bpy.data.lights.new(name=name, type="SUN")
@@ -1537,23 +1513,13 @@ def cleanup_temp_render_file(base_path_no_ext: str):
             pass
 
 
-
 def render_rgb_and_normal(
     rgb_path: str,
-    normal_output_node=None,
-    render_normal_map: bool = True,
+    normal_output_node,
     scene_box_obj=None,
     render_scene_box: bool = False,
     scene_box_affect_normal: bool = False,
 ):
-    if (not render_normal_map) or (normal_output_node is None):
-        if scene_box_obj is not None:
-            scene_box_obj.hide_render = not render_scene_box
-        render_frame(rgb_path)
-        if scene_box_obj is not None:
-            scene_box_obj.hide_render = True
-        return
-
     if (scene_box_obj is None) or (not render_scene_box):
         if scene_box_obj is not None:
             scene_box_obj.hide_render = True
@@ -1830,18 +1796,12 @@ def process_geometry(args):
     mesh_ply_dir = output_prefix + "_mesh_ply"
     meta_dir = output_prefix + "_meta"
 
-    render_view_indices = get_render_view_indices(args.num_cameras, args.camera_stride)
-    print(f"Camera stride = {args.camera_stride}")
-    print(f"Rendered view indices = {render_view_indices}")
-
     json_exists = os.path.exists(output_file)
     glb_exists = (normalized_glb_path == "") or os.path.exists(normalized_glb_path)
     mesh_npz_exists = os.path.exists(mesh_npz_path)
     ply_dir_exists = (not args.export_keyframe_ply) or os.path.isdir(mesh_ply_dir)
-    rgb_videos_exist = all_view_mp4_exist(rgb_video_dir, render_view_indices)
-    normal_videos_exist = (not args.render_normal_map) or all_view_mp4_exist(
-        normal_video_dir, render_view_indices
-    )
+    rgb_videos_exist = all_view_mp4_exist(rgb_video_dir, args.num_cameras)
+    normal_videos_exist = all_view_mp4_exist(normal_video_dir, args.num_cameras)
 
     # if to_skip_40075(output_file):
     #     return
@@ -1860,8 +1820,7 @@ def process_geometry(args):
             f"json={output_file}, glb={normalized_glb_path or 'N/A'}, "
             f"mesh_npz={mesh_npz_path}, "
             f"mesh_ply_dir={mesh_ply_dir if args.export_keyframe_ply else 'disabled'}, "
-            f"rgb_video_dir={rgb_video_dir}, "
-            f"normal_video_dir={normal_video_dir if args.render_normal_map else 'disabled'}"
+            f"rgb_video_dir={rgb_video_dir}, normal_video_dir={normal_video_dir}"
         )
         return
 
@@ -1876,17 +1835,15 @@ def process_geometry(args):
         print("[video] Start PNG -> MP4 export ...")
         convert_png_sequences_to_mp4_and_cleanup(
             output_prefix=output_prefix,
-            view_indices=render_view_indices,
+            num_cameras=args.num_cameras,
             fps=args.video_fps,
-            export_normal=args.render_normal_map,
         )
         return
 
     os.makedirs(rgb_dir, exist_ok=True)
+    os.makedirs(normal_dir, exist_ok=True)
     os.makedirs(rgb_video_dir, exist_ok=True)
-    if args.render_normal_map:
-        os.makedirs(normal_dir, exist_ok=True)
-        os.makedirs(normal_video_dir, exist_ok=True)
+    os.makedirs(normal_video_dir, exist_ok=True)
     if args.export_keyframe_ply:
         os.makedirs(mesh_ply_dir, exist_ok=True)
     os.makedirs(meta_dir, exist_ok=True)
@@ -1915,10 +1872,8 @@ def process_geometry(args):
         cycles_use_adaptive_sampling=(not args.disable_adaptive_sampling),
         cycles_device=args.cycles_device,
     )
-    normal_output_node = None
-    if args.render_normal_map:
-        normal_output_node = setup_normal_output(normal_dir)
-    timer.log("renderer + optional normal output setup")
+    normal_output_node = setup_normal_output(normal_dir)
+    timer.log("renderer + normal output setup")
 
     mesh_objs = []
     for obj in bpy.context.scene.objects:
@@ -2108,10 +2063,9 @@ def process_geometry(args):
             f"lighting={lighting['lighting_type']}, hdr_strength={lighting['hdr_strength']}"
         )
 
-    for view_idx in render_view_indices:
+    for view_idx in range(args.num_cameras):
         os.makedirs(os.path.join(rgb_dir, f"view_{view_idx:02d}"), exist_ok=True)
-        if args.render_normal_map:
-            os.makedirs(os.path.join(normal_dir, f"view_{view_idx:02d}"), exist_ok=True)
+        os.makedirs(os.path.join(normal_dir, f"view_{view_idx:02d}"), exist_ok=True)
         os.makedirs(os.path.join(meta_dir, f"view_{view_idx:02d}"), exist_ok=True)
 
     if normalized_glb_path:
@@ -2154,7 +2108,7 @@ def process_geometry(args):
         frame_key = f"frame_{frame_int:04d}"
         print(f"Processing {frame_key} ({local_frame_idx + 1}/{len(frame_indices)})")
 
-        last_view_idx = render_view_indices[-1]
+        last_view_idx = args.num_cameras - 1
         last_view_meta_path = get_view_meta_path(meta_dir, last_view_idx, frame_int)
 
         if os.path.isfile(last_view_meta_path):
@@ -2169,9 +2123,7 @@ def process_geometry(args):
         )
         bpy.context.view_layer.update()
 
-        for view_idx in render_view_indices:
-            camera_obj = camera_objs[view_idx]
-            camera_info = camera_infos[view_idx]
+        for view_idx, (camera_obj, camera_info) in enumerate(zip(camera_objs, camera_infos)):
             view_meta_path = get_view_meta_path(meta_dir, view_idx, frame_int)
             if os.path.isfile(view_meta_path):
                 print(f"Skip camera because meta exists: frame={frame_int}, view={view_idx}")
@@ -2195,18 +2147,14 @@ def process_geometry(args):
                 )
 
             view_rgb_dir = os.path.join(rgb_dir, f"view_{view_idx:02d}")
+            view_normal_dir = os.path.join(normal_dir, f"view_{view_idx:02d}")
             rgb_path = os.path.join(view_rgb_dir, f"frame_{frame_int:04d}.png")
-
-            normal_path = None
-            if args.render_normal_map:
-                view_normal_dir = os.path.join(normal_dir, f"view_{view_idx:02d}")
-                update_normal_output_path(normal_output_node, base_dir=view_normal_dir, prefix="frame_")
-                normal_path = os.path.join(view_normal_dir, f"frame_{frame_int:04d}.png")
+            update_normal_output_path(normal_output_node, base_dir=view_normal_dir, prefix="frame_")
+            normal_path = os.path.join(view_normal_dir, f"frame_{frame_int:04d}.png")
 
             render_rgb_and_normal(
                 rgb_path=rgb_path,
                 normal_output_node=normal_output_node,
-                render_normal_map=args.render_normal_map,
                 scene_box_obj=scene_box_obj,
                 render_scene_box=args.render_scene_box,
                 scene_box_affect_normal=args.scene_box_affect_normal,
@@ -2283,9 +2231,9 @@ def process_geometry(args):
         "faces_dtype": str(shared_faces.dtype),
         "image_storage_layout": "intermediate per_camera_png -> final per_camera_mp4",
         "intermediate_rgb_png_root": rgb_dir,
-        "intermediate_normal_png_root": normal_dir if args.render_normal_map else None,
+        "intermediate_normal_png_root": normal_dir,
         "final_rgb_video_root": rgb_video_dir,
-        "final_normal_video_root": normal_video_dir if args.render_normal_map else None,
+        "final_normal_video_root": normal_video_dir,
         "root_body_motion_removed_by": "single global bbox-center translation",
         "global_bbox_center_before_normalization": global_center.astype(np.float32).tolist(),
         "sequence_global_scale": float(sequence_scale),
@@ -2311,10 +2259,6 @@ def process_geometry(args):
             "missing_frames_example": [int(x) for x in motion_trim_summary["missing_frames_example"]],
         },
         "num_cameras": int(args.num_cameras),
-        "camera_stride": int(args.camera_stride),
-        "render_view_indices": [int(x) for x in render_view_indices],
-        "num_rendered_cameras": int(len(render_view_indices)),
-        "render_normal_map": bool(args.render_normal_map),
         "camera_seed": int(camera_seed),
         "camera_elev_min_deg": float(args.camera_elev_min_deg),
         "camera_elev_max_deg": float(args.camera_elev_max_deg),
@@ -2357,9 +2301,7 @@ def process_geometry(args):
             "status": "pending",
             "video_fps": int(args.video_fps),
             "rgb_video_root": rgb_video_dir,
-            "normal_video_root": normal_video_dir if args.render_normal_map else None,
-            "render_view_indices": [int(x) for x in render_view_indices],
-            "render_normal_map": bool(args.render_normal_map),
+            "normal_video_root": normal_video_dir,
         },
     }
 
@@ -2374,9 +2316,8 @@ def process_geometry(args):
         print("[video] Start PNG -> MP4 export ...")
         video_export_summary = convert_png_sequences_to_mp4_and_cleanup(
             output_prefix=output_prefix,
-            view_indices=render_view_indices,
+            num_cameras=args.num_cameras,
             fps=args.video_fps,
-            export_normal=args.render_normal_map,
         )
         final_watertight_data["_global"]["video_export"] = video_export_summary
         atomic_write_json(output_file, final_watertight_data)
@@ -2386,9 +2327,7 @@ def process_geometry(args):
             "status": "failed",
             "video_fps": int(args.video_fps),
             "rgb_video_root": rgb_video_dir,
-            "normal_video_root": normal_video_dir if args.render_normal_map else None,
-            "render_view_indices": [int(x) for x in render_view_indices],
-            "render_normal_map": bool(args.render_normal_map),
+            "normal_video_root": normal_video_dir,
             "error": str(e),
         }
         atomic_write_json(output_file, final_watertight_data)
@@ -2437,12 +2376,6 @@ if __name__ == "__main__":
     parser.add_argument("--traj_seed", type=int, default=0)
 
     parser.add_argument("--num_cameras", type=int, default=16)
-    parser.add_argument(
-        "--camera_stride",
-        type=int,
-        default=1,
-        help="Render every N-th camera. Example: 2 -> render view_00, view_02, view_04, ...",
-    )
     parser.add_argument("--camera_elev_min_deg", type=float, default=0.0)
     parser.add_argument("--camera_elev_max_deg", type=float, default=80.0)
     parser.add_argument("--camera_frame_padding", type=float, default=0.03)
@@ -2458,27 +2391,13 @@ if __name__ == "__main__":
     parser.add_argument("--max_frame", type=int, default=None)
 
     parser.add_argument(
-        "--render_normal_map",
-        dest="render_normal_map",
-        action="store_true",
-        help="Render normal maps. Default: enabled.",
-    )
-    parser.add_argument(
-        "--no_render_normal_map",
-        dest="render_normal_map",
-        action="store_false",
-        help="Disable normal map rendering.",
-    )
-    parser.set_defaults(render_normal_map=True)
-
-    parser.add_argument(
         "--cycles_backend",
         type=str,
         default="OPTIX",
         choices=["CUDA", "OPTIX"],
         help="Cycles GPU backend.",
     )
-    parser.add_argument("--cycles_samples", type=int, default=256)
+    parser.add_argument("--cycles_samples", type=int, default=64)
     parser.add_argument(
         "--cycles_use_denoising",
         action="store_true",
