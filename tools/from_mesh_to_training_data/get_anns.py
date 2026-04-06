@@ -300,4 +300,11 @@ python tools/from_mesh_to_training_data/get_anns.py \
   --tar_path data/rendering_v5_0323.tar \
   --num_test 100 \
   --seed 42
+
+python tools/from_mesh_to_training_data/get_anns.py \
+  --input_root data/objverse_minghao_4d_mine_40075/rendering_v5_0323/ \
+  --output_json data/objverse_minghao_4d_mine_40075/rendering_v5_anns_1.3k.json \
+  --tar_path data/objverse_minghao_4d_mine_40075/rendering_v5_0323.tar \
+  --num_test 100 \
+  --seed 42
 """
