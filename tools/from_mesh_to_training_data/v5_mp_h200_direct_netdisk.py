@@ -7,10 +7,12 @@ import os
 import json
 import gc
 import math
+import time
+import shutil
 import argparse
 import subprocess
-from typing import List, Dict
-
+from typing import List, Dict, Optional, Set, Iterable
+import numpy as np
 
 # 让脚本能 import 项目内模块
 f_path = Path(__file__).absolute()
@@ -21,6 +23,7 @@ machine = "h200"
 DEFAULT_ANNS_JSON = "data/objverse_minghao_4d_mine_40075/rendering_v5_anns_8cam.json"
 DEFAULT_DATASET_ROOT = "data/objverse_minghao_4d_mine_40075/rendering_v5"
 DEFAULT_OUTPUT_ROOT = "data/train_data_40075_objverse_minghao_4d_mine_rendering_v5_512_8camera"
+DEFAULT_LOCAL_SCRATCH_ROOT = "/tmp/mesh2sdf_netdisk_scratch"
 
 
 def load_object_dirs_from_anns(
@@ -51,12 +54,6 @@ def load_object_dirs_from_anns(
     if machine == "h200":
         uniq_new = []
         for x in uniq:
-            # import pdb
-            # pdb.set_trace()
-            # x = str(x).replace(
-            #     "/group/40075/yanruibin/objverse_minghao_4d_mine/rendering_v5",
-            #     DEFAULT_DATASET_ROOT,
-            # )
             uniq_new.append(Path(x))
         uniq = uniq_new
 
@@ -91,6 +88,88 @@ def save_shard_json(shard_paths: List[Path], save_path: Path):
     save_path.parent.mkdir(parents=True, exist_ok=True)
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump([str(p) for p in shard_paths], f, ensure_ascii=False, indent=2)
+
+
+def object_key_from_rel_obj_dir(rel_obj_dir: Path) -> str:
+    parts = rel_obj_dir.parts
+    if len(parts) >= 2:
+        return f"{parts[-2]}:{parts[-1]}"
+    return str(rel_obj_dir).replace(os.sep, ":")
+
+
+def infer_rel_obj_dir_mode(object_dirs: List[Path], dataset_root: Path) -> str:
+    """
+    只做词法判断，不访问文件系统。
+
+    - relative_to_dataset_root: root 可以直接相对到 dataset_root
+    - last_two_parts: root 与 dataset_root 路径风格不一致，或并非其子路径；
+      退化为使用 root 的最后两级目录（xxx-xxx/object_id）
+    """
+    if not dataset_root.is_absolute():
+        return "last_two_parts"
+
+    for root in object_dirs:
+        root = Path(root)
+        if not root.is_absolute():
+            return "last_two_parts"
+        try:
+            root.relative_to(dataset_root)
+            return "relative_to_dataset_root"
+        except ValueError:
+            return "last_two_parts"
+
+    return "relative_to_dataset_root"
+
+
+
+def rel_obj_dir_from_root(root: Path, dataset_root: Path, rel_obj_dir_mode: str) -> Path:
+    root = Path(root)
+    if rel_obj_dir_mode == "relative_to_dataset_root":
+        return root.relative_to(dataset_root)
+    if rel_obj_dir_mode == "last_two_parts":
+        parts = root.parts
+        if len(parts) >= 2:
+            return Path(parts[-2]) / parts[-1]
+        return Path(root.name)
+    raise ValueError(f"Unknown rel_obj_dir_mode: {rel_obj_dir_mode}")
+
+
+
+def object_key_from_root(root: Path, dataset_root: Path, rel_obj_dir_mode: str) -> str:
+    rel_obj_dir = rel_obj_dir_from_root(root, dataset_root, rel_obj_dir_mode)
+    return object_key_from_rel_obj_dir(rel_obj_dir)
+
+
+def load_unfinished_object_keys(log_path: Path) -> Optional[Set[str]]:
+    """
+    返回:
+      - None: log 文件不存在，表示没有历史 unfinished 记录
+      - set(): log 文件存在但为空
+      - 非空 set: 需要重跑的 object key 集合
+    """
+    if not log_path.exists():
+        return None
+
+    keys: Set[str] = set()
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            key = line.strip()
+            if key:
+                keys.add(key)
+    return keys
+
+
+def atomic_write_lines(path: Path, lines: Iterable[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(f"{line}\n")
+    os.replace(tmp_path, path)
+
+
+def write_unfinished_object_keys(log_path: Path, keys: Iterable[str]) -> None:
+    atomic_write_lines(log_path, sorted(keys))
 
 
 def load_camera_c2ws_from_result_json(result_json_path: Path):
@@ -130,131 +209,89 @@ def iter_selected_view_indices(num_views: int, view_stride: int, view_offset: in
         yield ic
 
 
-def object_is_fully_done(
-    save_obj_dir: Path,
+def file_exists_in_roots(rel_path: Path, roots: List[Path]) -> bool:
+    for root in roots:
+        if (root / rel_path).exists():
+            return True
+    return False
+
+
+def object_is_fully_done_in_roots(
+    obj_dirs: List[Path],
     frame_indices,
     num_views: int,
     resolution: int,
     view_stride: int,
     view_offset: int,
 ) -> bool:
+    """
+    与旧逻辑保持一致：只检查最后一帧是否存在。
+    这里只是把“某个文件是否存在”扩展成在多个根目录里查找。
+    """
     for ic in iter_selected_view_indices(num_views, view_stride, view_offset):
-        view_dir = save_obj_dir / f"view_{str(ic).zfill(2)}"
-        # for f_i in range(len(frame_indices)):
-        if True:
-            f_i = len(frame_indices) - 1
-            frame_tag = str(int(f_i)).zfill(3)
-            sdf_path = view_dir / f"sparse_sdf_{resolution}_{frame_tag}.npz"
-            sign_path = view_dir / f"sdf_sign_{resolution}_{frame_tag}.npz"
-            if (not sdf_path.exists()) or (not sign_path.exists()):
-                return False
+        view_dir_rel = Path(f"view_{str(ic).zfill(2)}")
+        f_i = len(frame_indices) - 1
+        frame_tag = str(int(f_i)).zfill(3)
+        sdf_rel = view_dir_rel / f"sparse_sdf_{resolution}_{frame_tag}.npz"
+        sign_rel = view_dir_rel / f"sdf_sign_{resolution}_{frame_tag}.npz"
+        if (not file_exists_in_roots(sdf_rel, obj_dirs)) or (not file_exists_in_roots(sign_rel, obj_dirs)):
+            return False
     return True
 
 
-def filter_unfinished_object_dirs(
-    object_dirs: List[Path],
-    dataset_root: Path,
-    output_root: Path,
-    resolution: int,
-    view_stride: int,
-    view_offset: int,
-) -> List[Path]:
+def copy_file_atomic(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_dst = dst.with_suffix(dst.suffix + ".tmp")
+    shutil.copy2(src, tmp_dst)
+    os.replace(tmp_dst, dst)
+
+
+def sync_tree(local_dir: Path, remote_dir: Path) -> int:
     """
-    仅保留未完成的 object dirs。
-    完成的定义：
-      对所有选中的 view，以及所有 frame，都已经存在
-      sparse_sdf_{resolution}_{frame}.npz 和 sdf_sign_{resolution}_{frame}.npz
+    将 local_dir 下的文件同步到 remote_dir。
+    返回同步的文件数量。
     """
-    kept = []
-    skipped_done = 0
-    skipped_invalid = 0
+    if not local_dir.exists():
+        return 0
 
-    for root in object_dirs:
-        try:
-            root = root.resolve()
-            if not root.exists():
-                print(f"[Launcher] WARNING object dir not found, keep it for worker failure handling: {root}")
-                kept.append(root)
-                continue
+    copied = 0
+    for src in local_dir.rglob("*"):
+        if src.is_dir():
+            continue
+        rel = src.relative_to(local_dir)
+        dst = remote_dir / rel
+        copy_file_atomic(src, dst)
+        copied += 1
+    return copied
 
-            mesh_path = root / "result_mesh.npz"
-            result_json_path = root / "result.json"
 
-            if (not mesh_path.exists()) or (not result_json_path.exists()):
-                print(f"[Launcher] WARNING missing result files, keep it for worker failure handling: {root}")
-                kept.append(root)
-                continue
+def safe_rmtree(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
 
-            rel_obj_dir = root.relative_to(dataset_root)
-            save_obj_dir = output_root / rel_obj_dir
 
-            camera_c2ws_bl = load_camera_c2ws_from_result_json(result_json_path)
-            num_views = len(camera_c2ws_bl)
-            if num_views == 0:
-                print(f"[Launcher] WARNING no cameras found, keep it for worker failure handling: {root}")
-                kept.append(root)
-                continue
-
-            with open(os.devnull, "w"):
-                npz = None
-                try:
-                    import numpy as np
-                    npz = np.load(mesh_path, mmap_mode="r")
-                    frame_indices = np.array(npz["frame_indices"])
-                finally:
-                    if npz is not None:
-                        del npz
-
-            if object_is_fully_done(
-                save_obj_dir=save_obj_dir,
-                frame_indices=frame_indices,
-                num_views=num_views,
-                resolution=resolution,
-                view_stride=view_stride,
-                view_offset=view_offset,
-            ):
-                skipped_done += 1
-                continue
-
-            kept.append(root)
-
-        except Exception as e:
-            skipped_invalid += 1
-            print(f"[Launcher] WARNING failed to check completion for {root}: {repr(e)}")
-            print(f"[Launcher] Keep this object for worker processing.")
-            kept.append(root)
-
-    print(f"[Launcher] unfinished filter: keep={len(kept)}, skip_done={skipped_done}, check_failed={skipped_invalid}")
-    return kept
+def save_npz_compressed_atomic(path: Path, **arrays) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp.npz")
+    np.savez_compressed(tmp_path, **arrays)
+    os.replace(tmp_path, path)
 
 
 def run_launcher(args):
-    anns_json = Path(args.anns_json).resolve()
-    dataset_root = Path(args.dataset_root).resolve()
-    output_root = Path(args.output_root).resolve()
+    anns_json = Path(args.anns_json)
+    dataset_root = Path(args.dataset_root)
+    output_root = Path(args.output_root)
 
     assert anns_json.exists(), f"anns_json not found: {anns_json}"
     assert dataset_root.exists(), f"dataset_root not found: {dataset_root}"
 
     gpu_ids = args.gpu_ids
     assert len(gpu_ids) > 0, "Please provide at least one gpu id via --gpu_ids"
-    # import pdb
-    # pdb.set_trace()
+
     object_dirs = load_object_dirs_from_anns(
         anns_json=anns_json,
         splits=args.splits,
     )
-
-    # 仅保留未完成对象
-    if args.only_unfinished_object:
-        object_dirs = filter_unfinished_object_dirs(
-            object_dirs=object_dirs,
-            dataset_root=dataset_root,
-            output_root=output_root,
-            resolution=args.resolution,
-            view_stride=args.view_stride,
-            view_offset=args.view_offset,
-        )
 
     if args.start_idx is not None or args.end_idx is not None:
         s = 0 if args.start_idx is None else args.start_idx
@@ -279,9 +316,12 @@ def run_launcher(args):
         big_chunks = split_list_into_chunks(object_dirs, args.num_chunks)
         object_dirs = big_chunks[args.chunk_id]
 
+    rel_obj_dir_mode = infer_rel_obj_dir_mode(object_dirs, dataset_root)
+
     print(f"[Launcher] anns_json   : {anns_json}")
     print(f"[Launcher] dataset_root: {dataset_root}")
     print(f"[Launcher] output_root : {output_root}")
+    print(f"[Launcher] local_scratch_root : {args.local_scratch_root}")
     print(f"[Launcher] splits      : {args.splits}")
     print(f"[Launcher] gpu_ids     : {gpu_ids}")
     print(f"[Launcher] num_chunks  : {args.num_chunks}")
@@ -290,6 +330,7 @@ def run_launcher(args):
     print(f"[Launcher] view_stride : {args.view_stride}")
     print(f"[Launcher] view_offset : {args.view_offset}")
     print(f"[Launcher] only_unfinished_object : {args.only_unfinished_object}")
+    print(f"[Launcher] rel_obj_dir_mode : {rel_obj_dir_mode}")
 
     if len(object_dirs) == 0:
         print("[Launcher] No object dirs to process. Exit.")
@@ -300,16 +341,39 @@ def run_launcher(args):
     shard_dir = output_root / "_submit_shards"
     shard_dir.mkdir(parents=True, exist_ok=True)
 
+    job_token = f"pid{os.getpid()}_{int(time.time())}"
     procs = []
     for worker_rank, gpu_id in enumerate(gpu_ids):
         shard = shards[worker_rank]
-        if len(shard) == 0:
-            print(f"[Launcher] Worker {worker_rank} on GPU {gpu_id}: empty shard, skip")
-            continue
 
         chunk_suffix = ""
         if args.num_chunks is not None:
             chunk_suffix = f"_chunk{args.chunk_id}of{args.num_chunks}"
+
+        unfinished_log_path = output_root / f"worker_{worker_rank}_gpu{gpu_id}{chunk_suffix}_unfinished.log"
+
+        if args.only_unfinished_object:
+            unfinished_keys = load_unfinished_object_keys(unfinished_log_path)
+            if unfinished_keys is None:
+                print(
+                    f"[Launcher] Worker {worker_rank} on GPU {gpu_id}: "
+                    f"unfinished log not found, keep full shard ({len(shard)} objs)"
+                )
+            else:
+                orig_len = len(shard)
+                shard = [
+                    root for root in shard
+                    if object_key_from_root(root, dataset_root, rel_obj_dir_mode) in unfinished_keys
+                ]
+                print(
+                    f"[Launcher] Worker {worker_rank} on GPU {gpu_id}: "
+                    f"filter by unfinished log -> {len(shard)}/{orig_len} objs"
+                )
+                print(f"[Launcher] Unfinished log -> {unfinished_log_path}")
+
+        if len(shard) == 0:
+            print(f"[Launcher] Worker {worker_rank} on GPU {gpu_id}: empty shard, skip")
+            continue
 
         shard_json = shard_dir / f"shard_worker{worker_rank}_gpu{gpu_id}{chunk_suffix}.json"
         save_shard_json(shard, shard_json)
@@ -326,6 +390,10 @@ def run_launcher(args):
             "--resolution", str(args.resolution),
             "--view_stride", str(args.view_stride),
             "--view_offset", str(args.view_offset),
+            "--unfinished_log_path", str(unfinished_log_path),
+            "--local_scratch_root", str(args.local_scratch_root),
+            "--job_token", job_token,
+            "--rel_obj_dir_mode", rel_obj_dir_mode,
         ]
         if args.overwrite:
             cmd.append("--overwrite")
@@ -333,28 +401,33 @@ def run_launcher(args):
             cmd.append("--skip_existing_object")
         if args.save_failures:
             cmd.append("--save_failures")
+        if args.keep_local_scratch:
+            cmd.append("--keep_local_scratch")
 
         log_path = output_root / f"worker_{worker_rank}_gpu{gpu_id}{chunk_suffix}.log"
         print(f"[Launcher] Start worker {worker_rank} | GPU {gpu_id} | objs {len(shard)}")
-        print(f"[Launcher] Log -> {log_path}")
+        print(f"[Launcher] Stdout log      -> {log_path}")
+        print(f"[Launcher] Unfinished log  -> {unfinished_log_path}")
 
         with open(log_path, "w", encoding="utf-8") as log_f:
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            print(" ".join(cmd))
             proc = subprocess.Popen(
                 cmd,
                 stdout=log_f,
                 stderr=subprocess.STDOUT,
                 env=env,
             )
-            procs.append((worker_rank, gpu_id, proc, log_path))
+            procs.append((worker_rank, gpu_id, proc, log_path, unfinished_log_path))
 
     exit_codes = []
-    for worker_rank, gpu_id, proc, log_path in procs:
+    for worker_rank, gpu_id, proc, log_path, unfinished_log_path in procs:
         ret = proc.wait()
         exit_codes.append(ret)
         print(f"[Launcher] Worker {worker_rank} | GPU {gpu_id} finished with code {ret}")
-        print(f"[Launcher] See log: {log_path}")
+        print(f"[Launcher] See stdout log     : {log_path}")
+        print(f"[Launcher] See unfinished log : {unfinished_log_path}")
 
     if any(code != 0 for code in exit_codes):
         raise RuntimeError(f"Some workers failed. exit_codes={exit_codes}")
@@ -371,15 +444,19 @@ def run_worker(args):
 
     worker_rank = args.worker_rank
     gpu_id = args.gpu_id
-    shard_json = Path(args.shard_json).resolve()
-    dataset_root = Path(args.dataset_root).resolve()
-    output_root = Path(args.output_root).resolve()
+    shard_json = Path(args.shard_json)
+    dataset_root = Path(args.dataset_root)
+    output_root = Path(args.output_root)
+    unfinished_log_path = Path(args.unfinished_log_path)
+    local_scratch_root = Path(args.local_scratch_root)
     resolution = args.resolution
     view_stride = args.view_stride
     view_offset = args.view_offset
 
     with open(shard_json, "r", encoding="utf-8") as f:
         object_dirs = [Path(x) for x in json.load(f)]
+
+    rel_obj_dir_mode = args.rel_obj_dir_mode or infer_rel_obj_dir_mode(object_dirs, dataset_root)
 
     # launcher 已经设置 CUDA_VISIBLE_DEVICES=<gpu_id>
     # 对 worker 来说可见 GPU 只有 1 张，所以统一用 cuda:0
@@ -392,11 +469,30 @@ def run_worker(args):
     print(f"[Worker {worker_rank}] num_objects = {len(object_dirs)}")
     print(f"[Worker {worker_rank}] dataset_root = {dataset_root}")
     print(f"[Worker {worker_rank}] output_root = {output_root}")
+    print(f"[Worker {worker_rank}] local_scratch_root (unused in direct-netdisk mode) = {local_scratch_root}")
+    print(f"[Worker {worker_rank}] unfinished_log_path = {unfinished_log_path}")
     print(f"[Worker {worker_rank}] resolution = {resolution}")
     print(f"[Worker {worker_rank}] view_stride = {view_stride}")
     print(f"[Worker {worker_rank}] view_offset = {view_offset}")
+    print(f"[Worker {worker_rank}] rel_obj_dir_mode = {rel_obj_dir_mode}")
+
+    pending_object_keys = {
+        object_key_from_root(root, dataset_root, rel_obj_dir_mode): None
+        for root in object_dirs
+    }
+
+    def flush_unfinished_logs():
+        write_unfinished_object_keys(unfinished_log_path, pending_object_keys.keys())
+
+    flush_unfinished_logs()
 
     failures: List[Dict] = []
+
+    def mark_object_finished(root: Path):
+        key = object_key_from_root(root, dataset_root, rel_obj_dir_mode)
+        if key in pending_object_keys:
+            pending_object_keys.pop(key, None)
+            flush_unfinished_logs()
 
     def to_numpy(x):
         if isinstance(x, torch.Tensor):
@@ -410,8 +506,13 @@ def run_worker(args):
             yield ic
 
     for root in tqdm(object_dirs, desc=f"worker{worker_rank}", dynamic_ncols=True):
+        mesh_f = None
+        view_rot_mats = None
+        mesh_v_list = None
+        mesh_f_np = None
+        f_indices = None
         try:
-            root = root.resolve()
+            root = Path(root)
             if not root.exists():
                 raise FileNotFoundError(f"object dir not found: {root}")
 
@@ -427,17 +528,19 @@ def run_worker(args):
             # 保持和 input 一致的目录结构:
             # input : dataset_root/xxx-xxx/object_id
             # output: output_root /xxx-xxx/object_id
-            rel_obj_dir = root.relative_to(dataset_root)
-            save_obj_dir = output_root / rel_obj_dir
-            save_obj_dir.mkdir(exist_ok=True, parents=True)
+            rel_obj_dir = rel_obj_dir_from_root(root, dataset_root, rel_obj_dir_mode)
+            remote_obj_dir = output_root / rel_obj_dir
+            remote_obj_dir.mkdir(exist_ok=True, parents=True)
 
-            npz = np.load(mesh_path, mmap_mode="r")
-            mesh_v_list = npz["vertices"]      # T N 3
-            mesh_f_np = npz["faces"]           # F 3
-            f_indices = np.array(npz["frame_indices"])
+            # 一次性把 npz 内容读进内存，避免 mmap 在网盘上产生碎片化读。
+            with np.load(mesh_path) as npz:
+                mesh_v_list = np.array(npz["vertices"])
+                mesh_f_np = np.array(npz["faces"])
+                f_indices = np.array(npz["frame_indices"])
 
-            if args.skip_existing_object and object_is_fully_done(
-                save_obj_dir=save_obj_dir,
+            object_roots = [remote_obj_dir]
+            if args.skip_existing_object and object_is_fully_done_in_roots(
+                obj_dirs=object_roots,
                 frame_indices=f_indices,
                 num_views=len(camera_c2ws_bl),
                 resolution=resolution,
@@ -445,7 +548,7 @@ def run_worker(args):
                 view_offset=view_offset,
             ):
                 print(f"[Worker {worker_rank}] Skip fully done object: {root}")
-                del npz
+                mark_object_finished(root)
                 continue
 
             mesh_f = torch.from_numpy(mesh_f_np).to(dtype=torch.int32, device=device)
@@ -460,19 +563,24 @@ def run_worker(args):
                 w2c_rot = torch.from_numpy(w2c[:3, :3]).to(dtype=torch.float32, device=device)
                 view_rot_mats.append(w2c_rot)
 
+            num_saved_files = 0
             with torch.inference_mode():
                 for ic in worker_iter_selected_view_indices(len(view_rot_mats)):
                     w2c_rot = view_rot_mats[ic]
-                    view_dir = save_obj_dir / f"view_{str(ic).zfill(2)}"
+                    view_dir = remote_obj_dir / f"view_{str(ic).zfill(2)}"
                     view_dir.mkdir(exist_ok=True, parents=True)
 
-                    for i, f_i in enumerate(f_indices):
+                    for i, _ in enumerate(f_indices):
                         frame_tag = str(int(i)).zfill(3)
-                        sdf_path = view_dir / f"sparse_sdf_{resolution}_{frame_tag}.npz"
-                        sign_path = view_dir / f"sdf_sign_{resolution}_{frame_tag}.npz"
+                        sdf_rel = Path(f"view_{str(ic).zfill(2)}") / f"sparse_sdf_{resolution}_{frame_tag}.npz"
+                        sign_rel = Path(f"view_{str(ic).zfill(2)}") / f"sdf_sign_{resolution}_{frame_tag}.npz"
 
-                        if (not args.overwrite) and sdf_path.exists() and sign_path.exists():
+                        if (not args.overwrite) and file_exists_in_roots(sdf_rel, object_roots) and file_exists_in_roots(sign_rel, object_roots):
                             continue
+
+                        sdf_path = remote_obj_dir / sdf_rel
+                        sign_path = remote_obj_dir / sign_rel
+                        sdf_path.parent.mkdir(exist_ok=True, parents=True)
 
                         mesh_v = None
                         mesh_wt = None
@@ -495,24 +603,32 @@ def run_worker(args):
                             sparse_index_np = to_numpy(sparse_index)
                             sdf_sign_np = to_numpy(sdf_sign)
 
-                            np.savez_compressed(
+                            save_npz_compressed_atomic(
                                 sdf_path,
                                 sparse_sdf=sparse_sdf_np,
                                 sparse_index=sparse_index_np,
                             )
-                            np.savez_compressed(
+                            save_npz_compressed_atomic(
                                 sign_path,
                                 sdf_sign=sdf_sign_np,
                             )
+                            num_saved_files += 2
 
                         finally:
                             del mesh_v, mesh_wt, sparse_sdf, sparse_index, mesh_scale, sdf_sign
-                            gc.collect()
-                            torch.cuda.empty_cache()
+
+            print(
+                f"[Worker {worker_rank}] Finished object {object_key_from_rel_obj_dir(rel_obj_dir)} "
+                f"with direct remote writes: saved_files={num_saved_files}"
+            )
+
+            mark_object_finished(root)
 
             del view_rot_mats
             del mesh_f
-            del npz
+            del mesh_v_list
+            del mesh_f_np
+            del f_indices
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -531,6 +647,8 @@ def run_worker(args):
         with open(fail_path, "w", encoding="utf-8") as f:
             json.dump(failures, f, ensure_ascii=False, indent=2)
         print(f"[Worker {worker_rank}] failures saved to {fail_path}")
+
+    flush_unfinished_logs()
 
     if len(failures) > 0:
         print(f"[Worker {worker_rank}] Finished with {len(failures)} failures")
@@ -561,6 +679,17 @@ def parse_args():
         type=str,
         default=DEFAULT_OUTPUT_ROOT,
         help="Root of output training data",
+    )
+    parser.add_argument(
+        "--local_scratch_root",
+        type=str,
+        default=DEFAULT_LOCAL_SCRATCH_ROOT,
+        help="Local scratch root on fast local disk, e.g. /tmp",
+    )
+    parser.add_argument(
+        "--keep_local_scratch",
+        action="store_true",
+        help="Keep local scratch after worker finishes, useful for debugging",
     )
     parser.add_argument(
         "--splits",
@@ -625,7 +754,8 @@ def parse_args():
     parser.add_argument(
         "--only_unfinished_object",
         action="store_true",
-        help="Only load unfinished object dirs in launcher stage",
+        help="For each worker, only run objects listed in its unfinished log. "
+             "If the unfinished log does not exist, keep the full shard.",
     )
     parser.add_argument(
         "--save_failures",
@@ -653,6 +783,15 @@ def parse_args():
     parser.add_argument("--worker_rank", type=int, default=-1, help="Internal")
     parser.add_argument("--gpu_id", type=int, default=-1, help="Internal")
     parser.add_argument("--shard_json", type=str, default="", help="Internal")
+    parser.add_argument("--unfinished_log_path", type=str, default="", help="Internal")
+    parser.add_argument("--job_token", type=str, default="", help="Internal")
+    parser.add_argument(
+        "--rel_obj_dir_mode",
+        type=str,
+        default="",
+        choices=["", "relative_to_dataset_root", "last_two_parts"],
+        help="Internal: how to map object root to relative output dir",
+    )
 
     return parser.parse_args()
 
@@ -669,6 +808,10 @@ def main():
         )
 
     if args.worker:
+        if not args.unfinished_log_path:
+            raise ValueError("--unfinished_log_path is required in worker mode")
+        if not args.job_token:
+            raise ValueError("--job_token is required in worker mode")
         run_worker(args)
     else:
         run_launcher(args)
@@ -678,20 +821,9 @@ if __name__ == "__main__":
     main()
 
 """
-python tools/from_mesh_to_training_data/v3_mp_h200.py \
+python tools/from_mesh_to_training_data/v5_mp_h200_netdisk_optimized.py \
   --splits train test \
-  --gpu_ids 1 2 3 4 5 6 7 \
-  --resolution 512 \
-  --num_chunks 1 \
-  --chunk_id 0 \
-  --only_unfinished_object \
-  --skip_existing_object \
-  --save_failures \
-  --view_stride 2
-
-  python tools/from_mesh_to_training_data/v3_mp_h200.py \
-  --splits train test \
-  --gpu_ids 1 \
+  --gpu_ids 0 1 2 3 4 5 6 7 \
   --resolution 512 \
   --num_chunks 1 \
   --chunk_id 0 \
@@ -699,5 +831,16 @@ python tools/from_mesh_to_training_data/v3_mp_h200.py \
   --skip_existing_object \
   --save_failures \
   --view_stride 2 \
-  --worker
+  --local_scratch_root /tmp/mesh2sdf_netdisk_scratch
+
+python tools/from_mesh_to_training_data/v5_mp_h200.py \
+  --splits train test \
+  --gpu_ids 0  \
+  --resolution 512 \
+  --num_chunks 1 \
+  --chunk_id 0 \
+  --only_unfinished_object \
+  --save_failures \
+  --view_stride 2 \
+  --local_scratch_root /tmp/mesh2sdf_netdisk_scratch
 """

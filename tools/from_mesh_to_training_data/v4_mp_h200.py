@@ -9,7 +9,7 @@ import gc
 import math
 import argparse
 import subprocess
-from typing import List, Dict
+from typing import List, Dict, Optional, Set
 
 
 # 让脚本能 import 项目内模块
@@ -93,6 +93,44 @@ def save_shard_json(shard_paths: List[Path], save_path: Path):
         json.dump([str(p) for p in shard_paths], f, ensure_ascii=False, indent=2)
 
 
+def object_key_from_rel_obj_dir(rel_obj_dir: Path) -> str:
+    parts = rel_obj_dir.parts
+    if len(parts) >= 2:
+        return f"{parts[-2]}:{parts[-1]}"
+    return str(rel_obj_dir).replace(os.sep, ":")
+
+
+def object_key_from_root(root: Path, dataset_root: Path) -> str:
+    rel_obj_dir = root.resolve().relative_to(dataset_root.resolve())
+    return object_key_from_rel_obj_dir(rel_obj_dir)
+
+
+def load_unfinished_object_keys(log_path: Path) -> Optional[Set[str]]:
+    """
+    返回:
+      - None: log 文件不存在，表示没有历史 unfinished 记录
+      - set(): log 文件存在但为空
+      - 非空 set: 需要重跑的 object key 集合
+    """
+    if not log_path.exists():
+        return None
+
+    keys: Set[str] = set()
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            key = line.strip()
+            if key:
+                keys.add(key)
+    return keys
+
+
+def write_unfinished_object_keys(log_path: Path, keys) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as f:
+        for key in keys:
+            f.write(f"{key}\n")
+
+
 def load_camera_c2ws_from_result_json(result_json_path: Path):
     """
     兼容两种 meta 格式，返回按 view_index 排序后的 camera_c2w list
@@ -151,82 +189,6 @@ def object_is_fully_done(
     return True
 
 
-def filter_unfinished_object_dirs(
-    object_dirs: List[Path],
-    dataset_root: Path,
-    output_root: Path,
-    resolution: int,
-    view_stride: int,
-    view_offset: int,
-) -> List[Path]:
-    """
-    仅保留未完成的 object dirs。
-    完成的定义：
-      对所有选中的 view，以及所有 frame，都已经存在
-      sparse_sdf_{resolution}_{frame}.npz 和 sdf_sign_{resolution}_{frame}.npz
-    """
-    kept = []
-    skipped_done = 0
-    skipped_invalid = 0
-
-    for root in object_dirs:
-        try:
-            root = root.resolve()
-            if not root.exists():
-                print(f"[Launcher] WARNING object dir not found, keep it for worker failure handling: {root}")
-                kept.append(root)
-                continue
-
-            mesh_path = root / "result_mesh.npz"
-            result_json_path = root / "result.json"
-
-            if (not mesh_path.exists()) or (not result_json_path.exists()):
-                print(f"[Launcher] WARNING missing result files, keep it for worker failure handling: {root}")
-                kept.append(root)
-                continue
-
-            rel_obj_dir = root.relative_to(dataset_root)
-            save_obj_dir = output_root / rel_obj_dir
-
-            camera_c2ws_bl = load_camera_c2ws_from_result_json(result_json_path)
-            num_views = len(camera_c2ws_bl)
-            if num_views == 0:
-                print(f"[Launcher] WARNING no cameras found, keep it for worker failure handling: {root}")
-                kept.append(root)
-                continue
-
-            with open(os.devnull, "w"):
-                npz = None
-                try:
-                    import numpy as np
-                    npz = np.load(mesh_path, mmap_mode="r")
-                    frame_indices = np.array(npz["frame_indices"])
-                finally:
-                    if npz is not None:
-                        del npz
-
-            if object_is_fully_done(
-                save_obj_dir=save_obj_dir,
-                frame_indices=frame_indices,
-                num_views=num_views,
-                resolution=resolution,
-                view_stride=view_stride,
-                view_offset=view_offset,
-            ):
-                skipped_done += 1
-                continue
-
-            kept.append(root)
-
-        except Exception as e:
-            skipped_invalid += 1
-            print(f"[Launcher] WARNING failed to check completion for {root}: {repr(e)}")
-            print(f"[Launcher] Keep this object for worker processing.")
-            kept.append(root)
-
-    print(f"[Launcher] unfinished filter: keep={len(kept)}, skip_done={skipped_done}, check_failed={skipped_invalid}")
-    return kept
-
 
 def run_launcher(args):
     anns_json = Path(args.anns_json).resolve()
@@ -238,23 +200,11 @@ def run_launcher(args):
 
     gpu_ids = args.gpu_ids
     assert len(gpu_ids) > 0, "Please provide at least one gpu id via --gpu_ids"
-    # import pdb
-    # pdb.set_trace()
+
     object_dirs = load_object_dirs_from_anns(
         anns_json=anns_json,
         splits=args.splits,
     )
-
-    # 仅保留未完成对象
-    if args.only_unfinished_object:
-        object_dirs = filter_unfinished_object_dirs(
-            object_dirs=object_dirs,
-            dataset_root=dataset_root,
-            output_root=output_root,
-            resolution=args.resolution,
-            view_stride=args.view_stride,
-            view_offset=args.view_offset,
-        )
 
     if args.start_idx is not None or args.end_idx is not None:
         s = 0 if args.start_idx is None else args.start_idx
@@ -303,13 +253,35 @@ def run_launcher(args):
     procs = []
     for worker_rank, gpu_id in enumerate(gpu_ids):
         shard = shards[worker_rank]
-        if len(shard) == 0:
-            print(f"[Launcher] Worker {worker_rank} on GPU {gpu_id}: empty shard, skip")
-            continue
 
         chunk_suffix = ""
         if args.num_chunks is not None:
             chunk_suffix = f"_chunk{args.chunk_id}of{args.num_chunks}"
+
+        unfinished_log_path = output_root / f"worker_{worker_rank}_gpu{gpu_id}{chunk_suffix}_unfinished.log"
+
+        if args.only_unfinished_object:
+            unfinished_keys = load_unfinished_object_keys(unfinished_log_path)
+            if unfinished_keys is None:
+                print(
+                    f"[Launcher] Worker {worker_rank} on GPU {gpu_id}: "
+                    f"unfinished log not found, keep full shard ({len(shard)} objs)"
+                )
+            else:
+                orig_len = len(shard)
+                shard = [
+                    root for root in shard
+                    if object_key_from_root(root, dataset_root) in unfinished_keys
+                ]
+                print(
+                    f"[Launcher] Worker {worker_rank} on GPU {gpu_id}: "
+                    f"filter by unfinished log -> {len(shard)}/{orig_len} objs"
+                )
+                print(f"[Launcher] Unfinished log -> {unfinished_log_path}")
+
+        if len(shard) == 0:
+            print(f"[Launcher] Worker {worker_rank} on GPU {gpu_id}: empty shard, skip")
+            continue
 
         shard_json = shard_dir / f"shard_worker{worker_rank}_gpu{gpu_id}{chunk_suffix}.json"
         save_shard_json(shard, shard_json)
@@ -326,6 +298,7 @@ def run_launcher(args):
             "--resolution", str(args.resolution),
             "--view_stride", str(args.view_stride),
             "--view_offset", str(args.view_offset),
+            "--unfinished_log_path", str(unfinished_log_path),
         ]
         if args.overwrite:
             cmd.append("--overwrite")
@@ -336,7 +309,8 @@ def run_launcher(args):
 
         log_path = output_root / f"worker_{worker_rank}_gpu{gpu_id}{chunk_suffix}.log"
         print(f"[Launcher] Start worker {worker_rank} | GPU {gpu_id} | objs {len(shard)}")
-        print(f"[Launcher] Log -> {log_path}")
+        print(f"[Launcher] Stdout log      -> {log_path}")
+        print(f"[Launcher] Unfinished log  -> {unfinished_log_path}")
 
         with open(log_path, "w", encoding="utf-8") as log_f:
             env = os.environ.copy()
@@ -347,14 +321,15 @@ def run_launcher(args):
                 stderr=subprocess.STDOUT,
                 env=env,
             )
-            procs.append((worker_rank, gpu_id, proc, log_path))
+            procs.append((worker_rank, gpu_id, proc, log_path, unfinished_log_path))
 
     exit_codes = []
-    for worker_rank, gpu_id, proc, log_path in procs:
+    for worker_rank, gpu_id, proc, log_path, unfinished_log_path in procs:
         ret = proc.wait()
         exit_codes.append(ret)
         print(f"[Launcher] Worker {worker_rank} | GPU {gpu_id} finished with code {ret}")
-        print(f"[Launcher] See log: {log_path}")
+        print(f"[Launcher] See stdout log     : {log_path}")
+        print(f"[Launcher] See unfinished log : {unfinished_log_path}")
 
     if any(code != 0 for code in exit_codes):
         raise RuntimeError(f"Some workers failed. exit_codes={exit_codes}")
@@ -374,6 +349,7 @@ def run_worker(args):
     shard_json = Path(args.shard_json).resolve()
     dataset_root = Path(args.dataset_root).resolve()
     output_root = Path(args.output_root).resolve()
+    unfinished_log_path = Path(args.unfinished_log_path).resolve()
     resolution = args.resolution
     view_stride = args.view_stride
     view_offset = args.view_offset
@@ -392,11 +368,24 @@ def run_worker(args):
     print(f"[Worker {worker_rank}] num_objects = {len(object_dirs)}")
     print(f"[Worker {worker_rank}] dataset_root = {dataset_root}")
     print(f"[Worker {worker_rank}] output_root = {output_root}")
+    print(f"[Worker {worker_rank}] unfinished_log_path = {unfinished_log_path}")
     print(f"[Worker {worker_rank}] resolution = {resolution}")
     print(f"[Worker {worker_rank}] view_stride = {view_stride}")
     print(f"[Worker {worker_rank}] view_offset = {view_offset}")
 
+    pending_object_keys = {
+        object_key_from_root(root, dataset_root): None
+        for root in object_dirs
+    }
+    write_unfinished_object_keys(unfinished_log_path, pending_object_keys.keys())
+
     failures: List[Dict] = []
+
+    def mark_object_finished(root: Path):
+        key = object_key_from_root(root, dataset_root)
+        if key in pending_object_keys:
+            pending_object_keys.pop(key, None)
+            write_unfinished_object_keys(unfinished_log_path, pending_object_keys.keys())
 
     def to_numpy(x):
         if isinstance(x, torch.Tensor):
@@ -446,6 +435,7 @@ def run_worker(args):
             ):
                 print(f"[Worker {worker_rank}] Skip fully done object: {root}")
                 del npz
+                mark_object_finished(root)
                 continue
 
             mesh_f = torch.from_numpy(mesh_f_np).to(dtype=torch.int32, device=device)
@@ -509,6 +499,18 @@ def run_worker(args):
                             del mesh_v, mesh_wt, sparse_sdf, sparse_index, mesh_scale, sdf_sign
                             gc.collect()
                             torch.cuda.empty_cache()
+
+            if not object_is_fully_done(
+                save_obj_dir=save_obj_dir,
+                frame_indices=f_indices,
+                num_views=len(camera_c2ws_bl),
+                resolution=resolution,
+                view_stride=view_stride,
+                view_offset=view_offset,
+            ):
+                raise RuntimeError(f"object not fully done after processing: {root}")
+
+            mark_object_finished(root)
 
             del view_rot_mats
             del mesh_f
@@ -625,7 +627,8 @@ def parse_args():
     parser.add_argument(
         "--only_unfinished_object",
         action="store_true",
-        help="Only load unfinished object dirs in launcher stage",
+        help="For each worker, only run objects listed in its unfinished log. "
+             "If the unfinished log does not exist, keep the full shard.",
     )
     parser.add_argument(
         "--save_failures",
@@ -653,6 +656,7 @@ def parse_args():
     parser.add_argument("--worker_rank", type=int, default=-1, help="Internal")
     parser.add_argument("--gpu_id", type=int, default=-1, help="Internal")
     parser.add_argument("--shard_json", type=str, default="", help="Internal")
+    parser.add_argument("--unfinished_log_path", type=str, default="", help="Internal")
 
     return parser.parse_args()
 
@@ -678,9 +682,9 @@ if __name__ == "__main__":
     main()
 
 """
-python tools/from_mesh_to_training_data/v3_mp_h200.py \
+python tools/from_mesh_to_training_data/v4_mp_h200.py \
   --splits train test \
-  --gpu_ids 1 2 3 4 5 6 7 \
+  --gpu_ids 0 \
   --resolution 512 \
   --num_chunks 1 \
   --chunk_id 0 \

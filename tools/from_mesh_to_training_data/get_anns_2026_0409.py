@@ -7,7 +7,7 @@ import random
 import re
 import tarfile
 from pathlib import Path
-from typing import List, Set
+from typing import List, Optional, Set
 from tqdm import tqdm
 
 
@@ -20,7 +20,7 @@ def has_complete_mp4_views(mp4_dir: Path, num_views: int = 16) -> bool:
         return False
 
     for i in range(num_views):
-        f = mp4_dir / f"view_{i:02d}.mp4"
+        f = mp4_dir / f"view_{i*2:02d}.mp4"
         if not f.exists():
             return False
     return True
@@ -31,15 +31,16 @@ def is_valid_object_dir(obj_dir: Path, num_views: int = 16) -> bool:
     result_mesh = obj_dir / "result_mesh.npz"
     rgb_dir = obj_dir / "result_rgb_mp4"
     normal_dir = obj_dir / "result_normal_mp4"
-
+    # import pdb 
+    # pdb.set_trace()
     if not result_json.exists():
         return False
     if not result_mesh.exists():
         return False
     if not has_complete_mp4_views(rgb_dir, num_views=num_views):
         return False
-    if not has_complete_mp4_views(normal_dir, num_views=num_views):
-        return False
+    # if not has_complete_mp4_views(normal_dir, num_views=num_views):
+    #     return False
 
     return True
 
@@ -126,6 +127,17 @@ def extract_object_relpaths_from_tar(tar_path: Path) -> Set[Path]:
     return object_relpaths
 
 
+def parse_optional_path(path_str: Optional[str]) -> Optional[Path]:
+    if path_str is None:
+        return None
+
+    normalized = path_str.strip()
+    if normalized == "" or normalized.lower() == "none":
+        return None
+
+    return Path(normalized).resolve()
+
+
 def save_anns_json(train_dirs: List[Path], test_dirs: List[Path], save_path: Path):
     save_path.parent.mkdir(parents=True, exist_ok=True)
     anns = {
@@ -140,8 +152,9 @@ def save_anns_json(train_dirs: List[Path], test_dirs: List[Path], save_path: Pat
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Generate anns.json from valid rendering_v5 object dirs, "
-            "restricted to objects that are actually included in a given tar."
+            "Generate anns.json from valid rendering_v5 object dirs. "
+            "If --tar_path is provided, only keep objects that are included in that tar. "
+            "If --tar_path is omitted or None, use all valid objects from the filesystem scan."
         )
     )
     parser.add_argument(
@@ -153,8 +166,11 @@ def main():
     parser.add_argument(
         "--tar_path",
         type=str,
-        required=True,
-        help="Path to an existing tar file, e.g. data/rendering_v5_0323.tar",
+        default=None,
+        help=(
+            "Optional path to an existing tar file, e.g. data/rendering_v5_0323.tar. "
+            "If omitted, empty, or 'None', no tar-based filtering is applied."
+        ),
     )
     parser.add_argument(
         "--output_json",
@@ -216,16 +232,20 @@ def main():
     args = parser.parse_args()
 
     input_root = Path(args.input_root).resolve()
-    tar_path = Path(args.tar_path).resolve()
+    tar_path = parse_optional_path(args.tar_path)
     output_json = Path(args.output_json).resolve()
 
     if not input_root.exists():
         raise FileNotFoundError(f"input_root not found: {input_root}")
-    if not tar_path.exists():
+    if tar_path is not None and not tar_path.exists():
         raise FileNotFoundError(f"tar_path not found: {tar_path}")
 
     print(f"[Info] Scanning filesystem root: {input_root}")
-    print(f"[Info] Restricting to tar content: {tar_path}")
+    if tar_path is not None:
+        print(f"[Info] Restricting to tar content: {tar_path}")
+    else:
+        print("[Info] No tar_path provided, using all valid object dirs from filesystem scan")
+
     print("[Info] Valid object condition:")
     print("       - result.json exists")
     print("       - result_mesh.npz exists")
@@ -248,17 +268,27 @@ def main():
 
     print(f"[Info] Valid object dirs after slicing: {len(valid_object_dirs)}")
 
-    tar_object_relpaths = extract_object_relpaths_from_tar(tar_path)
-    print(f"[Info] Unique object dirs found in tar: {len(tar_object_relpaths)}")
+    if tar_path is not None:
+        tar_object_relpaths = extract_object_relpaths_from_tar(tar_path)
+        print(f"[Info] Unique object dirs found in tar: {len(tar_object_relpaths)}")
 
-    selected_object_dirs = []
-    for obj_dir in valid_object_dirs:
-        rel_obj_dir = obj_dir.relative_to(input_root)
-        if rel_obj_dir in tar_object_relpaths:
-            selected_object_dirs.append(obj_dir)
+        selected_object_dirs = []
+        for obj_dir in valid_object_dirs:
+            rel_obj_dir = obj_dir.relative_to(input_root)
+            if rel_obj_dir in tar_object_relpaths:
+                selected_object_dirs.append(obj_dir)
 
-    selected_object_dirs = sorted(selected_object_dirs, key=lambda p: natural_key(str(p.relative_to(input_root))))
-    print(f"[Info] Final selected object dirs (valid AND in tar): {len(selected_object_dirs)}")
+        selected_object_dirs = sorted(
+            selected_object_dirs,
+            key=lambda p: natural_key(str(p.relative_to(input_root))),
+        )
+        print(f"[Info] Final selected object dirs (valid AND in tar): {len(selected_object_dirs)}")
+    else:
+        selected_object_dirs = sorted(
+            valid_object_dirs,
+            key=lambda p: natural_key(str(p.relative_to(input_root))),
+        )
+        print(f"[Info] Final selected object dirs (all valid dirs): {len(selected_object_dirs)}")
 
     if len(selected_object_dirs) == 0:
         print("[Warning] No matched object dirs found. Nothing to save.")
@@ -292,19 +322,11 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 """
-python tools/from_mesh_to_training_data/get_anns.py \
+python tools/from_mesh_to_training_data/get_anns_2026_0409.py \
   --input_root data/objverse_minghao_4d_mine_40075/rendering_v5/ \
   --output_json data/objverse_minghao_4d_mine_40075/rendering_v5_anns_8cam.json \
-  --tar_path data/rendering_v5_8cam.tar \
-  --num_test 100 \
-  --seed 42
-
-python tools/from_mesh_to_training_data/get_anns.py \
-  --input_root data/objverse_minghao_4d_mine_40075/rendering_v5_0323/ \
-  --output_json data/objverse_minghao_4d_mine_40075/rendering_v5_anns_1.3k.json \
-  --tar_path data/objverse_minghao_4d_mine_40075/rendering_v5_0323.tar \
+  --num_views 8 \
   --num_test 100 \
   --seed 42
 """
