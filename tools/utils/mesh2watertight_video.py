@@ -331,6 +331,7 @@ def sphere_normalize_torch_rescale(vertices):
 def cubvh_mesh2watertightsd_vid(mesh_v, mesh_f, output_resolution=1024):
     """
     这里假设mesh_v已经在video level归一化在[-0.5, 0.5];
+    先 ×2 到 [-1, 1]，再 ×0.95 到 [-0.95, 0.95] 后送入 BVH。
     """
     if output_resolution ==1024:
         resolution = 1024
@@ -342,16 +343,12 @@ def cubvh_mesh2watertightsd_vid(mesh_v, mesh_f, output_resolution=1024):
         raise ValueError("Only support output_resolution 1024 or 512")
     device = mesh_v.device
     mesh_scale = 0.5
-    vertices = mesh_v
+    # 先 ×2 放大到 [-1, 1]，再 ×0.95 缩到 [-0.95, 0.95]
+    vertices = mesh_v * 2.0 * 0.95
     triangles = mesh_f
-    
-    # vertices , bcenter, radius = sphere_normalize_torch_rescale(vertices)
-    mesh_v = mesh_v * 2.
-    mesh_scale = mesh_scale * 2.
-    radius = torch.tensor(0.5)
 
-    vertices = vertices * 0.95
-    mesh_scale *= 0.95
+    mesh_scale = mesh_scale * 2.0 * 0.95
+    radius = torch.tensor(0.5)
 
     ################
     # 1. 膨胀后的sdf
